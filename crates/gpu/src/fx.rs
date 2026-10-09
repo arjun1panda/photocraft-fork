@@ -92,15 +92,7 @@ impl MapProgram {
     /// the reach each field was computed with.
     pub fn windows(&self, d: Rect, region: Rect, field_reach: &dyn Fn(FieldKind) -> i32) -> Vec<Rect> {
         let n = self.stages.len();
-        let reach_of = |reach: &[i32], i: Option<In>| match i {
-            Some(In::Val(k)) => reach[k],
-            Some(In::Field(f)) => field_radius(f, field_reach(f)),
-            _ => 0,
-        };
-        let mut reach = vec![0i32; n];
-        for (i, s) in self.stages.iter().enumerate() {
-            reach[i] = reach_of(&reach, s.a).max(reach_of(&reach, s.b)).max(reach_of(&reach, s.s)) + s.radius;
-        }
+        let reach = self.stage_reach(field_reach);
         let mut need = vec![Rect::EMPTY; n];
         for (i, s) in self.stages.iter().enumerate() {
             if s.out.is_some() {
@@ -121,6 +113,27 @@ impl MapProgram {
             }
         }
         need
+    }
+
+    /// Per stage, how far (px) its output depends on the shape.
+    fn stage_reach(&self, field_reach: &dyn Fn(FieldKind) -> i32) -> Vec<i32> {
+        let mut reach: Vec<i32> = Vec::with_capacity(self.stages.len());
+        for s in &self.stages {
+            let of = |i: Option<In>| match i {
+                Some(In::Val(k)) => reach.get(k).copied().unwrap_or(0),
+                Some(In::Field(f)) => field_radius(f, field_reach(f)),
+                _ => 0,
+            };
+            let r = of(s.a).max(of(s.b)).max(of(s.s)) + s.radius;
+            reach.push(r);
+        }
+        reach
+    }
+
+    /// How far (px) any final map depends on the shape: maps computed over a window are exact
+    /// at least this far inside it.
+    pub fn reach(&self, field_reach: &dyn Fn(FieldKind) -> i32) -> i32 {
+        self.stage_reach(field_reach).into_iter().zip(&self.stages).filter(|(_, s)| s.out.is_some()).map(|(r, _)| r).max().unwrap_or(0)
     }
 
     /// Physical temporary index per stage (None for final maps), reusing temporaries after
@@ -277,7 +290,7 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
             if r > 0.0 {
                 // dist_outside of the shifted map is the shifted field (integer offsets; shifted-in
                 // pixels are far away for a drop shadow, inside for an inner shadow).
-                let f = b.field(if inner { FieldKind::OutsideInverse } else { FieldKind::Outside }, r);
+                let f = b.field(if inner { FieldKind::ChokeInside } else { FieldKind::StrokeOutside }, r);
                 let d = if dx == 0.0 && dy == 0.0 {
                     f
                 } else {
@@ -308,7 +321,7 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
                     let (r, bw) = photocraft_compose::effects::spread_split(g.size, g.spread);
                     let mut m = src;
                     if r > 0.0 {
-                        let d = b.field(if inner { FieldKind::OutsideInverse } else { FieldKind::Outside }, r);
+                        let d = b.field(if inner { FieldKind::ChokeInside } else { FieldKind::StrokeOutside }, r);
                         m = b.dilate(src, d, r);
                     }
                     let m = b.blur(m, bw);
@@ -372,16 +385,18 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
             let (sa, ca) = angle.to_radians().sin_cos();
             let (se, ce) = altitude.to_radians().sin_cos();
             let lut = contour_lut(&bv.gloss_contour).map(Arc::new);
-            let passes: Vec<(f32, bool)> = match g.paint {
-                BevelPaint::Inner => vec![(g.depth, false)],
-                BevelPaint::Outer => vec![(g.depth, true)],
-                BevelPaint::Both => vec![(g.depth, false), (if g.pillow { -g.depth } else { g.depth }, true)],
+            // Region (`fs_mbevelshade`): 0 inside, 1 under the edge and outside, 2 / 3 emboss /
+            // pillow emboss (both halves in one map).
+            let passes: Vec<(f32, f32)> = match g.paint {
+                BevelPaint::Inner => vec![(g.depth, 0.0)],
+                BevelPaint::Outer => vec![(g.depth, 1.0)],
+                BevelPaint::Both => vec![(g.depth, if g.pillow { 3.0 } else { 2.0 })],
             };
             let mut out = 0;
-            for (depth, outer) in &passes {
+            for (depth, region) in &passes {
                 for which in [0.0, 1.0] {
                     let mut s = stage(Kernel::MBevelShade, Some(h), None, [ca * ce, -sa * ce, se, se], 1);
-                    s.p1 = [*depth, f32::from(u8::from(*outer)), which, f32::from(u8::from(lut.is_some()))];
+                    s.p1 = [*depth, *region, which, f32::from(u8::from(lut.is_some()))];
                     s.lut = lut.clone();
                     s.s = Some(In::Shape);
                     s.out = Some(out);
@@ -549,6 +564,13 @@ pub(crate) fn shape_key(layer: &Layer, canvas: Rect) -> u64 {
             let fr = photocraft_compose::fill_frame(layer, canvas);
             (fr.x0, fr.y0, fr.x1, fr.y1, content.is_some()).hash(&mut h);
         }
+        // A filled shape's effect shape follows its outline too.
+        LayerContent::Shape(sh) => {
+            std::mem::discriminant(&layer.content).hash(&mut h);
+            if photocraft_compose::effect_outline(layer).is_some() {
+                format!("{:?}", sh.path).hash(&mut h);
+            }
+        }
         other => std::mem::discriminant(other).hash(&mut h),
     }
     for s in [content, mask].into_iter().flatten() {
@@ -668,14 +690,9 @@ mod tests {
                 shape[y * w + x] = (90.0 - r).clamp(0.0, 1.0) * if (x / 13 + y / 17) % 5 == 0 { 0.6 } else { 1.0 };
             }
         }
-        for kind in [
-            FieldKind::Outside,
-            FieldKind::Inside,
-            FieldKind::OutsideInverse,
-            FieldKind::StrokeOutside,
-            FieldKind::StrokeInside,
-            FieldKind::StrokeOutsideVector,
-        ] {
+        for kind in
+            [FieldKind::Outside, FieldKind::Inside, FieldKind::ChokeInside, FieldKind::StrokeOutside, FieldKind::StrokeInside, FieldKind::StrokeOutsideVector]
+        {
             let reach = 9;
             let whole = photocraft_compose::effects::distance_field(kind, shape.clone(), w, h);
             let banded = field(kind, reach, &shape, region, region);

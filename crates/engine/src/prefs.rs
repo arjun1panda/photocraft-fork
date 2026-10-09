@@ -58,7 +58,19 @@ choice!(ColorPicker { Adobe = "adobe", System = "system" } default Adobe);
 choice!(Theme { Pro = "pro", ProMedium = "proMedium", Studio = "studio", StudioLight = "studioLight", Classic = "classic" } default ProMedium);
 choice!(CanvasColor { Default = "default", Black = "black", DarkGray = "darkGray", MediumGray = "mediumGray", LightGray = "lightGray", Custom = "custom" } default Default);
 choice!(CanvasBorder { DropShadow = "dropShadow", Line = "line", None = "none" } default DropShadow);
-choice!(UiScale { Auto = "auto", P100 = "100", P200 = "200" } default Auto);
+choice!(UiScale { Auto = "auto", P75 = "75", P100 = "100", P125 = "125", P150 = "150", P175 = "175", P200 = "200", P250 = "250", P300 = "300" } default Auto);
+choice!(
+    /// Graphics backend of the desktop app's window and GPU canvas (applies at next launch).
+    /// `auto` lets PhotoCraft pick (DX12 for Intel adapters on Windows); `cpu` composites on the
+    /// CPU and draws the window with a software adapter where the platform has one. A start that
+    /// crashes inside the graphics driver moves this to the next safer choice.
+    GpuBackend { Auto = "auto", Vulkan = "vulkan", Dx12 = "dx12", Metal = "metal", Gl = "gl", Cpu = "cpu" } default Auto
+);
+choice!(
+    /// Rendering policy, independent of the advanced graphics backend selection.
+    /// CPU disables image acceleration; the native window may still need hardware graphics.
+    RenderingMode { Auto = "auto", Gpu = "gpu", Cpu = "cpu" } default Auto
+);
 choice!(UiFontSize { Tiny = "tiny", Small = "small", Medium = "medium", Large = "large" } default Small);
 choice!(LogDestination { Metadata = "metadata", TextFile = "textFile", Both = "both" } default Metadata);
 choice!(LogDetail { SessionsOnly = "sessionsOnly", Concise = "concise", Detailed = "detailed" } default Concise);
@@ -70,6 +82,11 @@ choice!(
     /// Painting cursors: Standard (tool icon), Precise (crosshair), Normal Brush Tip (the 50%
     /// opacity contour), Full Size Brush Tip (the whole diameter).
     PaintingCursor { Standard = "standard", Precise = "precise", NormalTip = "normalTip", FullSizeTip = "fullSizeTip" } default NormalTip
+);
+choice!(
+    /// Right mouse button on the canvas with a painting tool: open the Brush Preset picker at the
+    /// pointer (Photoshop), or erase with the current brush while dragging (Krita, Paint).
+    RightClickPaint { BrushPicker = "brushPicker", Erase = "erase" } default BrushPicker
 );
 choice!(OtherCursor { Standard = "standard", Precise = "precise" } default Standard);
 choice!(CheckerSize { None = "none", Small = "small", Medium = "medium", Large = "large" } default Medium);
@@ -189,12 +206,23 @@ pub struct Interface {
     /// Document border in standard screen mode.
     pub canvas_border: CanvasBorder,
     pub ui_scale: UiScale,
+    /// UI language: `auto` (follow the system) or a language code such as `en`, `ja`. The list of
+    /// languages belongs to the shell (`ui-egui` i18n); an unknown code falls back to `auto`.
+    /// Command ids and the control protocol stay English.
+    pub language: String,
     pub ui_font_size: UiFontSize,
     pub show_channels_in_color: bool,
     pub dynamic_color_sliders: bool,
     /// Draw menu item colours set with Edit › Menus.
     pub show_menu_colors: bool,
     pub show_tooltips: bool,
+    /// Move tool drags show only the layer's outline and an arrow, leaving its pixels in place
+    /// until release. Off (the default), the pixels follow the pointer live inside the outline.
+    pub show_bounding_box_when_dragging_layer: bool,
+    /// Windows and Linux: use the system's title bar and window buttons instead of PhotoCraft's
+    /// own one-row title bar (tiling window managers, desktops that draw their own decorations;
+    /// #1271, #1316). Read when the app starts. macOS always uses the system's.
+    pub system_title_bar: bool,
 }
 
 impl Default for Interface {
@@ -205,11 +233,14 @@ impl Default for Interface {
             canvas_custom_color: "#282828".into(),
             canvas_border: CanvasBorder::DropShadow,
             ui_scale: UiScale::Auto,
+            language: "auto".into(),
             ui_font_size: UiFontSize::Small,
             show_channels_in_color: false,
             dynamic_color_sliders: true,
             show_menu_colors: true,
             show_tooltips: true,
+            show_bounding_box_when_dragging_layer: false,
+            system_title_bar: false,
         }
     }
 }
@@ -254,6 +285,10 @@ pub struct Tools {
     pub show_transformation_values: bool,
     pub overscroll: bool,
     pub double_click_layer_mask_launches_select_and_mask: bool,
+    /// What the right mouse button does on the canvas with the Brush and other painting tools.
+    pub right_click_with_painting_tools: RightClickPaint,
+    /// Pen tablets: pressure, tilt and rotation reach the brush (off: a pen paints like a mouse).
+    pub use_tablet_pressure: bool,
 }
 
 impl Default for Tools {
@@ -268,6 +303,8 @@ impl Default for Tools {
             show_transformation_values: true,
             overscroll: true,
             double_click_layer_mask_launches_select_and_mask: true,
+            right_click_with_painting_tools: RightClickPaint::BrushPicker,
+            use_tablet_pressure: true,
         }
     }
 }
@@ -332,6 +369,9 @@ pub struct Export {
     pub quick_export_format: QuickExportFormat,
     pub quick_export_location: ExportLocation,
     pub jpeg_quality: u32,
+    /// Keep the existing lossless Quick Export default until the user opts into lossy WebP.
+    pub webp_lossless: bool,
+    pub webp_quality: u32,
     pub metadata: ExportMetadata,
     pub convert_to_srgb: bool,
 }
@@ -342,6 +382,8 @@ impl Default for Export {
             quick_export_format: QuickExportFormat::Png,
             quick_export_location: ExportLocation::Ask,
             jpeg_quality: 85,
+            webp_lossless: true,
+            webp_quality: 85,
             metadata: ExportMetadata::Copyright,
             convert_to_srgb: true,
         }
@@ -362,12 +404,25 @@ pub struct Performance {
     pub cache_tile_size: u32,
     /// Draw the canvas with the GPU (applies at next launch).
     pub use_gpu: bool,
+    /// Explicit rendering policy. None preserves older useGpu/gpuBackend preferences.
+    pub rendering_mode: Option<RenderingMode>,
+    /// Graphics backend (applies at next launch; see [`GpuBackend`]).
+    pub gpu_backend: GpuBackend,
+    /// Live previews of large documents (adjustment and filter dialogs, an adjustment layer's
+    /// sliders while they drag) render on a reduced copy: fast, but blocky when zoomed in. Off:
+    /// they render at full resolution.
+    pub low_resolution_previews: bool,
     /// Memory budget of the layer-effect cache, in MB.
     pub effect_cache_mb: u32,
     pub legacy_compositing: bool,
 }
 
 impl Performance {
+    /// Resolve old preferences without allowing legacy flags to override an explicit mode.
+    pub fn effective_rendering_mode(&self) -> RenderingMode {
+        self.rendering_mode.unwrap_or_else(|| if !self.use_gpu || self.gpu_backend == GpuBackend::Cpu { RenderingMode::Cpu } else { RenderingMode::Auto })
+    }
+
     /// Pixel memory a document and its History may hold (Memory Usage), in bytes: beyond it
     /// the oldest history states are dropped.
     pub fn history_budget_bytes(&self) -> usize {
@@ -383,6 +438,9 @@ impl Default for Performance {
             cache_levels: 4,
             cache_tile_size: 8192,
             use_gpu: true,
+            rendering_mode: None,
+            gpu_backend: GpuBackend::Auto,
+            low_resolution_previews: true,
             effect_cache_mb: 768,
             legacy_compositing: false,
         }
@@ -633,6 +691,10 @@ pub struct RawDefaults {
     pub sharpen_for: RawSharpen,
     pub open_as_smart_object: bool,
     pub apply_auto_tone: bool,
+    /// Opening a raw file interactively shows the Camera Raw dialog first (Open / Cancel), as
+    /// Photoshop does; off develops it with the defaults straight away. Automation opens never
+    /// show the dialog.
+    pub open_in_camera_raw: bool,
 }
 
 impl Default for RawDefaults {
@@ -644,6 +706,7 @@ impl Default for RawDefaults {
             sharpen_for: RawSharpen::None,
             open_as_smart_object: false,
             apply_auto_tone: false,
+            open_in_camera_raw: true,
         }
     }
 }
@@ -714,6 +777,13 @@ pub struct Preferences {
     pub workspaces: BTreeMap<String, Value>,
     /// Window › Workspace › Lock Workspace: panels can't be moved.
     pub workspace_locked: bool,
+    /// The live panel layout (dock group heights, order, collapsed groups, open panels), saved
+    /// as the user changes it and restored at launch when Workspace › Remember Workspace
+    /// Changes is on. JSON owned by the shell.
+    pub panel_layout: Value,
+    /// The last choices of dialogs that remember them across restarts, by command id (Edit ›
+    /// Fill…: `"edit.fill"` → its params). JSON owned by the shell.
+    pub dialogs: BTreeMap<String, Value>,
     /// File › Scripts › Script Events Manager: event → script bindings.
     pub script_events: crate::automate_cmds::ScriptEvents,
 }
@@ -740,6 +810,78 @@ pub const SECTIONS: [(&str, &str); 18] = [
     ("integrations", "Integrations"),
 ];
 
+/// Preferences that nothing reads yet, so Edit › Preferences doesn't show them: a control that
+/// does nothing is worse than a missing one (https://github.com/storytold/photocraft/issues/204).
+/// They still load, save and round-trip through `prefs.get` / `prefs.set` unchanged.
+///
+/// When you implement one, remove it here; the `prefs_usage` test fails while a listed
+/// preference is read anywhere outside `prefs.rs`, and while an unlisted one is read nowhere.
+pub const HIDDEN_UNTIL_IMPLEMENTED: &[&str] = &[
+    "general.colorPicker",
+    "general.beepWhenDone",
+    "general.exportClipboard",
+    "general.resizeImageDuringPlace",
+    "general.alwaysCreateSmartObjectsWhenPlacing",
+    "general.animatedZoom",
+    "general.zoomResizesWindows",
+    "interface.showChannelsInColor",
+    "interface.dynamicColorSliders",
+    "workspace.autoCollapseIconPanels",
+    "workspace.autoShowHiddenPanels",
+    "workspace.openDocumentsAsTabs",
+    "workspace.enableFloatingDocumentWindowDocking",
+    "workspace.largeTabs",
+    "workspace.enableNarrowOptionsBar",
+    "tools.enableFlickPanning",
+    "tools.varyRoundBrushHardnessOnHud",
+    "tools.showTransformationValues",
+    "tools.doubleClickLayerMaskLaunchesSelectAndMask",
+    "fileHandling.imagePreviews",
+    "fileHandling.lowercaseExtension",
+    "fileHandling.saveInBackground",
+    "fileHandling.ignoreExifProfileTag",
+    "fileHandling.maximizePsdCompatibility",
+    "performance.cacheLevels",
+    "performance.effectCacheMb",
+    "performance.legacyCompositing",
+    "scratchDisks.disks",
+    "cursors.brushPreviewColor",
+    "unitsAndRulers.typeUnits",
+    "unitsAndRulers.columnWidth",
+    "unitsAndRulers.gutter",
+    "unitsAndRulers.printResolution",
+    "unitsAndRulers.screenResolution",
+    "plugIns.showExtensionPanels",
+    "plugIns.allowScriptsToConnect",
+    "plugIns.generatorEnabled",
+    "type.smartQuotes",
+    "type.missingGlyphProtection",
+    "type.showFontNamesInEnglish",
+    "type.useEscToCommit",
+    "type.textEngine",
+    "type.fontPreview",
+    "type.fillNewTypeLayersWithPlaceholder",
+    "type.recentFonts",
+    "enhancedControls.scrubbySliderAcceleration",
+    "enhancedControls.touchGestures",
+    "enhancedControls.zoomWithTrackpadPinch",
+    "rawDefaults.colorSpace",
+    "rawDefaults.bitDepth",
+    "rawDefaults.resolution",
+    "rawDefaults.sharpenFor",
+    "rawDefaults.openAsSmartObject",
+    "rawDefaults.applyAutoTone",
+    // Agent access is governed by the launch flags (`--control`, the automation roots), not
+    // by these yet.
+    "integrations.allowAgentControl",
+    "integrations.controlPort",
+];
+
+/// Is the preference at `path` (`"section.key"`) hidden from the Preferences dialog?
+pub fn is_hidden(path: &str) -> bool {
+    HIDDEN_UNTIL_IMPLEMENTED.contains(&path)
+}
+
 /// Choices of an enumerated preference (dotted path, e.g. `"cursors.painting"`).
 pub fn choices(path: &str) -> Option<&'static [&'static str]> {
     Some(match path {
@@ -758,6 +900,7 @@ pub fn choices(path: &str) -> Option<&'static [&'static str]> {
         "export.metadata" => ExportMetadata::NAMES,
         "cursors.painting" => PaintingCursor::NAMES,
         "cursors.other" => OtherCursor::NAMES,
+        "tools.rightClickWithPaintingTools" => RightClickPaint::NAMES,
         "transparencyAndGamut.gridSize" => CheckerSize::NAMES,
         "transparencyAndGamut.gridColors" => CheckerColors::NAMES,
         "unitsAndRulers.rulers" | "guidesGridAndSlices.gridUnit" => Unit::NAMES,
@@ -769,6 +912,8 @@ pub fn choices(path: &str) -> Option<&'static [&'static str]> {
         "rawDefaults.colorSpace" => RawColorSpace::NAMES,
         "rawDefaults.bitDepth" => RawDepth::NAMES,
         "rawDefaults.sharpenFor" => RawSharpen::NAMES,
+        "performance.gpuBackend" => GpuBackend::NAMES,
+        "performance.renderingMode" => RenderingMode::NAMES,
         _ => return None,
     })
 }
@@ -778,7 +923,7 @@ pub fn range(path: &str) -> Option<(f64, f64)> {
     Some(match path {
         "fileHandling.autosaveMinutes" => (1.0, 240.0),
         "fileHandling.recentFileCount" => (0.0, 100.0),
-        "export.jpegQuality" => (1.0, 100.0),
+        "export.jpegQuality" | "export.webpQuality" => (1.0, 100.0),
         "performance.memoryUsageMb" => (256.0, 1_048_576.0),
         "performance.historyStates" => (1.0, 1000.0),
         "performance.cacheLevels" => (1.0, 8.0),
@@ -820,7 +965,7 @@ pub fn parse_hex(s: &str) -> Option<[u8; 3]> {
     if s.len() != 6 {
         return None;
     }
-    let b = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    let b = |i: usize| s.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok());
     Some([b(0)?, b(2)?, b(4)?])
 }
 
@@ -873,10 +1018,19 @@ fn set_path(root: &mut Value, path: &str, value: Value) -> std::result::Result<(
 
 /// Validate one value for `path` before it is stored (choices, ranges, colours).
 fn check_value(path: &str, v: &Value) -> std::result::Result<(), String> {
+    if path == "performance.renderingMode" && v.is_null() {
+        return Ok(()); // Legacy policy, resolved from useGpu and gpuBackend.
+    }
     if let Some(c) = choices(path) {
         let s = v.as_str().ok_or_else(|| format!("`{path}` must be one of {}", c.join("|")))?;
         if !c.contains(&s) {
             return Err(format!("`{path}` must be one of {} (got `{s}`)", c.join("|")));
+        }
+    }
+    if path == "interface.language" {
+        let ok = v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 16 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        if !ok {
+            return Err("`interface.language` must be `auto` or a language code such as `en` or `ja`".into());
         }
     }
     if let Some((lo, hi)) = range(path) {
@@ -934,6 +1088,18 @@ impl Preferences {
             *self = Preferences::default();
             return Ok(());
         };
+        // These maps have no stored defaults; removing an override restores the fallback.
+        match keyed(path) {
+            Some(("shortcuts", id)) => {
+                self.shortcuts.remove(id);
+                return Ok(());
+            }
+            Some(("menus.colors", id)) => {
+                self.menus.colors.remove(id);
+                return Ok(());
+            }
+            _ => {}
+        }
         let def = Preferences::default().get(path).ok_or_else(|| format!("unknown preference `{path}`"))?;
         if path == "shortcuts" {
             self.shortcuts.clear();
@@ -1027,6 +1193,22 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Hold-and-release gestures (#249): temporary tools that last while their key is held and give
+/// the previous tool back on release. They are bound like shortcuts (Edit › Keyboard Shortcuts ›
+/// Tools › Temporary, `edit.keyboardShortcuts`) but held rather than pressed, so they are not
+/// commands; the UI reads their keys through [`Preferences::shortcut`]. While a selection or
+/// shape is being dragged, the Hand key repositions it instead of panning (Photoshop's Space).
+pub const TEMPORARY_TOOLS: &[(&str, &str, &str)] = &[
+    ("tools.temporary.hand", "Hand Tool (hold)", "Space"),
+    ("tools.temporary.zoomIn", "Zoom In (hold, drag to scrub)", "Cmd+Space"),
+    ("tools.temporary.zoomOut", "Zoom Out (hold)", "Cmd+Alt+Space"),
+];
+
+/// Every bindable id with its default: commands, then the temporary tools.
+fn bindable() -> impl Iterator<Item = (&'static str, Option<&'static str>)> {
+    crate::command_specs().iter().map(|c| (c.id, c.shortcut)).chain(TEMPORARY_TOOLS.iter().map(|t| (t.0, Some(t.2))))
+}
+
 /// Shortcuts bound to more than one command: (shortcut, ids). `bindings` are (id, shortcut).
 pub fn conflicts<'a>(bindings: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<(String, Vec<String>)> {
     let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1092,13 +1274,18 @@ impl Session {
 
     /// Everything persisted as one JSON document: the preferences plus `colorSettings`.
     pub fn prefs_to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.prefs_value()).unwrap_or_default()
+    }
+
+    /// [`Session::prefs_to_json`] as a JSON tree (frontends merge it with what storage holds).
+    pub fn prefs_value(&self) -> Value {
         let mut v = self.prefs().to_json();
         if let Value::Object(m) = &mut v {
             m.insert("colorSettings".into(), serde_json::to_value(&self.color.settings).unwrap_or(Value::Null));
             m.insert("version".into(), json!(1));
             m.insert("presets".into(), self.presets.to_json(self));
         }
-        serde_json::to_string_pretty(&v).unwrap_or_default()
+        v
     }
 
     /// Restore preferences saved by [`Session::prefs_to_json`]. Missing keys keep their
@@ -1217,6 +1404,14 @@ fn prefs_reset(s: &mut Session, p: &Value) -> Result<Value> {
     let path = p.get("path").or_else(|| p.get("section")).and_then(Value::as_str);
     match path {
         Some("colorSettings") => s.color.settings = Default::default(),
+        // One colour setting: `Preferences` has no `colorSettings`, so take the default
+        // from `ColorSettings` and route it like `prefs.set` does.
+        Some(path) if path.starts_with("colorSettings.") => {
+            let defaults = serde_json::to_value(crate::color_cmds::ColorSettings::default()).map_err(|e| bad("prefs.reset", e.to_string()))?;
+            let key = path.strip_prefix("colorSettings.").unwrap_or(path);
+            let def = get_path(&defaults, key).cloned().ok_or_else(|| bad("prefs.reset", format!("unknown preference `{path}`")))?;
+            s.set_pref(path, def).map_err(|e| bad("prefs.reset", e))?;
+        }
         None => {
             s.color.settings = Default::default();
             s.edit_prefs(|p| p.reset(None)).map_err(|e| bad("prefs.reset", e))?;
@@ -1229,7 +1424,12 @@ fn prefs_reset(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.prefs.edit(|_| ());
     s.apply_prefs();
-    prefs_get(s, &json!({"path": path.unwrap_or("")}))
+    if path.is_some_and(|path| keyed(path).is_some()) {
+        // The removed override is absent, so reading its old path would report an error.
+        Ok(Value::Null)
+    } else {
+        prefs_get(s, &json!({"path": path.unwrap_or("")}))
+    }
 }
 
 /// `edit.preferences.<section>`: the section's values (the GUI opens the dialog on it instead).
@@ -1257,7 +1457,7 @@ fn keyboard_shortcuts(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(m) = p.get("set").and_then(Value::as_object) {
         let mut next = s.prefs().clone();
         for (id, v) in m {
-            if crate::commands::find(id).is_none() && !p.get("allowUnknown").and_then(Value::as_bool).unwrap_or(false) {
+            if !bindable().any(|(b, _)| b == id) && !p.get("allowUnknown").and_then(Value::as_bool).unwrap_or(false) {
                 return Err(bad(cmd, format!("unknown command `{id}`")));
             }
             next.set(&format!("shortcuts.{id}"), v.clone()).map_err(|e| bad(cmd, e))?;
@@ -1266,9 +1466,16 @@ fn keyboard_shortcuts(s: &mut Session, p: &Value) -> Result<Value> {
         if p.get("removeConflicts").and_then(Value::as_bool).unwrap_or(true) {
             for (id, v) in m {
                 let Some(sc) = v.as_str().and_then(normalize_shortcut) else { continue };
-                for c in crate::command_specs() {
-                    if c.id != id && next.shortcut(c.id, c.shortcut).and_then(normalize_shortcut).as_deref() == Some(sc.as_str()) {
-                        next.shortcuts.insert(c.id.to_string(), String::new());
+                for (c, def) in bindable() {
+                    // Never strip a command that this same call is assigning:
+                    // two entries for one key are a clash inside the call, which
+                    // the returned conflicts list reports (#719). Stripping
+                    // each other here unbound both silently.
+                    if c == id || m.contains_key(c) {
+                        continue;
+                    }
+                    if next.shortcut(c, def).and_then(normalize_shortcut).as_deref() == Some(sc.as_str()) {
+                        next.shortcuts.insert(c.to_string(), String::new());
                     }
                 }
             }
@@ -1277,13 +1484,22 @@ fn keyboard_shortcuts(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let prefs = s.prefs();
     let filter = p.get("filter").and_then(Value::as_str).map(str::to_ascii_lowercase);
+    let temporary = TEMPORARY_TOOLS.iter().map(|t| (t.0, t.1, &["Tools", "Temporary"][..], Some(t.2), true));
     let list: Vec<Value> = crate::command_specs()
         .iter()
-        .filter(|c| filter.as_ref().is_none_or(|f| c.id.to_ascii_lowercase().contains(f) || c.label.to_ascii_lowercase().contains(f)))
-        .filter(|c| p.get("list").and_then(Value::as_bool).unwrap_or(false) || filter.is_some() || prefs.shortcuts.contains_key(c.id))
-        .map(|c| json!({"id": c.id, "label": c.label, "menu": c.menu, "default": c.shortcut, "shortcut": prefs.shortcut(c.id, c.shortcut)}))
+        .map(|c| (c.id, c.label, c.menu, c.shortcut, false))
+        .chain(temporary)
+        .filter(|c| filter.as_ref().is_none_or(|f| c.0.to_ascii_lowercase().contains(f) || c.1.to_ascii_lowercase().contains(f)))
+        .filter(|c| p.get("list").and_then(Value::as_bool).unwrap_or(false) || filter.is_some() || prefs.shortcuts.contains_key(c.0))
+        .map(|(id, label, menu, def, hold)| {
+            let mut v = json!({"id": id, "label": label, "menu": menu, "default": def, "shortcut": prefs.shortcut(id, def)});
+            if hold {
+                v["hold"] = json!(true);
+            }
+            v
+        })
         .collect();
-    let bindings: Vec<(&str, &str)> = crate::command_specs().iter().filter_map(|c| Some((c.id, prefs.shortcut(c.id, c.shortcut)?))).collect();
+    let bindings: Vec<(&str, &str)> = bindable().filter_map(|(id, def)| Some((id, prefs.shortcut(id, def)?))).collect();
     let conflicts: Vec<Value> = conflicts(bindings).into_iter().map(|(sc, ids)| json!({"shortcut": sc, "commands": ids})).collect();
     Ok(json!({"overrides": prefs.shortcuts, "commands": list, "conflicts": conflicts}))
 }
@@ -1406,7 +1622,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Keyboard Shortcuts…",
             ["Edit"],
             Some("Cmd+Alt+Shift+K"),
-            r##"{"set":{"<command id>":"Cmd+Shift+X"|""(remove)|null(default)}?,"reset":true|["<id>",…]?,"removeConflicts":bool=true,"filter":str?,"list":bool=false}"##,
+            r##"{"set":{"<command id>|tools.temporary.hand|zoomIn|zoomOut":"Cmd+Shift+X"|""(remove)|null(default)}?,"reset":true|["<id>",…]?,"removeConflicts":bool=true,"filter":str?,"list":bool=false}"##,
             keyboard_shortcuts,
             true
         ),

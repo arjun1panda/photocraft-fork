@@ -5,12 +5,13 @@
 //! loopback TCP port.
 //!
 //! Methods (camelCase params):
-//! - `engine.execute {command, params?}` / `engine.commands {filter?}`
+//! - `engine.execute {command, params?, wait?}` / `engine.commands {filter?}`
+//! - `jobs.list` / `jobs.cancel {job?}`: background jobs (#210)
 //! - `session.list`, `doc.open {path}`, `doc.new {…file.new params}`,
 //!   `doc.save {path?, format?, quality?, index?}`, `doc.inspect {index?}`,
 //!   `doc.render {index?, maxSide?, path?}` (writes a PNG to `path`, else
 //!   returns it base64-encoded), `doc.select {index}`, `doc.close {index?}`
-//! - `batch {steps: [{command, params?} | {method, params?}], stopOnError?}`
+//! - `batch {steps: [{command, params?, wait?} | {method, params?}], stopOnError?}`
 //! - `methods`: this list.
 
 use std::io::{BufRead, Write};
@@ -21,14 +22,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+use crate::budgets::{BatchReplyBudget, write_reply};
 use crate::security::{
-    ConnectionLimiter, LineRead, MAX_BATCH_STEPS, MAX_CONNECTIONS, MAX_REQUEST_BYTES, authentication_reply, configure_stream, read_bounded_line,
+    ConnectionLimiter, LineRead, MAX_BATCH_STEPS, MAX_CONNECTIONS, MAX_REQUEST_BYTES, authentication_reply, configure_stream, discard_rest_of_line,
+    read_bounded_line,
 };
 use crate::{AutomationError, Headless};
 
 /// Method names served by [`Headless::handle`].
 pub const METHODS: &[&str] = &[
     "engine.execute",
+    "jobs.list",
+    "jobs.cancel",
     "engine.commands",
     "session.list",
     "doc.open",
@@ -57,12 +62,17 @@ fn str_of<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
 impl Headless {
     /// Dispatch one request. Unknown methods and bad params are errors, never panics.
     pub fn handle(&mut self, method: &str, params: Value) -> Result<Value, AutomationError> {
+        self.sync_jobs();
         let p = if params.is_null() { json!({}) } else { params };
         match method {
             "engine.execute" => {
                 let id = str_of(&p, "command").ok_or_else(|| bad("engine.execute needs `command`"))?;
-                self.command_run(id, p.get("params").cloned().unwrap_or(Value::Null))
+                let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(true);
+                self.command_start(id, p.get("params").cloned().unwrap_or(Value::Null), wait)
             }
+            // Background jobs (#210): list (applying any that finished) and cancel.
+            "jobs.list" => self.command_start("jobs.list", json!({}), true),
+            "jobs.cancel" => self.command_start("jobs.cancel", p, true),
             "engine.commands" => {
                 let all = self.command_list();
                 Ok(match str_of(&p, "filter").map(str::to_lowercase) {
@@ -87,16 +97,24 @@ impl Headless {
             }
             "doc.new" => self.command_run("file.new", p),
             "doc.save" => {
-                let mut opts = photocraft_io::ExportOptions::default();
+                let mut opts =
+                    photocraft_io::ExportOptions { tiff_layers: p.get("tiffLayers").and_then(Value::as_bool).unwrap_or(false), ..Default::default() };
                 if let Some(q) = p.get("quality").and_then(Value::as_u64) {
                     opts.encode.jpeg_quality = q.clamp(1, 100) as u8;
+                    opts.encode.webp_quality = q.clamp(1, 100) as u8;
+                    opts.encode.webp_lossless = false;
                 }
                 let path = str_of(&p, "path").map(PathBuf::from);
                 self.save(index_of(&p), path.as_deref(), str_of(&p, "format"), &opts)
             }
             "doc.inspect" => self.inspect(index_of(&p)),
             "doc.render" => {
-                let max = p.get("maxSide").and_then(Value::as_u64).unwrap_or(1024) as u32;
+                let max = match p.get("maxSide") {
+                    None => 1024,
+                    Some(value) => {
+                        value.as_u64().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| bad("maxSide must be an unsigned 32-bit integer"))?
+                    }
+                };
                 let png = self.render_png(index_of(&p), max)?;
                 match str_of(&p, "path") {
                     Some(path) => {
@@ -120,10 +138,16 @@ impl Headless {
         }
     }
 
-    /// Run `steps` in order. Each step is `{command, params?}` (an engine command) or
+    /// Run `steps` in order. Each step is `{command, params?, wait?}` (an engine command) or
     /// `{method, params?}` (any [`METHODS`] entry). Stops at the first error unless
     /// `stopOnError` is false; the reply lists every step's result.
     pub fn batch(&mut self, p: &Value) -> Result<Value, AutomationError> {
+        self.batch_with_budget(p, BatchReplyBudget::default())
+    }
+
+    /// [`Headless::batch`] with a caller's reply budget (MCP charges escaped sizes, see
+    /// [`BatchReplyBudget::escaped`]). Steps stop once the budget runs out.
+    pub fn batch_with_budget(&mut self, p: &Value, mut reply_budget: BatchReplyBudget) -> Result<Value, AutomationError> {
         let steps = p.get("steps").and_then(Value::as_array).ok_or_else(|| bad("batch needs `steps`"))?;
         if steps.len() > MAX_BATCH_STEPS {
             return Err(bad(format!("batch contains {} steps; maximum is {MAX_BATCH_STEPS}", steps.len())));
@@ -134,20 +158,29 @@ impl Headless {
         for (i, s) in steps.iter().enumerate() {
             let params = s.get("params").cloned().unwrap_or(Value::Null);
             let r = if let Some(c) = str_of(s, "command") {
-                self.command_run(c, params)
+                // Like `engine.execute`: `wait: false` starts a long command as a background job.
+                let wait = s.get("wait").and_then(Value::as_bool).unwrap_or(true);
+                self.command_start(c, params, wait)
             } else if let Some(m) = str_of(s, "method") {
                 if m == "batch" { Err(bad("nested batch")) } else { self.handle(m, params) }
             } else {
                 Err(bad(format!("step {i} needs `command` or `method`")))
             };
-            match r {
-                Ok(v) => results.push(json!({"ok": true, "result": v})),
-                Err(e) => {
-                    failed += 1;
-                    results.push(json!({"ok": false, "error": e.to_string()}));
-                    if stop {
-                        break;
-                    }
+            let was_error = r.is_err();
+            let result = match r {
+                Ok(v) => json!({"ok": true, "result": v}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            };
+            if let Err(error) = reply_budget.charge(&result) {
+                failed += 1;
+                results.push(json!({"ok": false, "error": format!("batch response budget exceeded; current step may have completed: {error}")}));
+                break;
+            }
+            results.push(result);
+            if was_error {
+                failed += 1;
+                if stop {
+                    break;
                 }
             }
         }
@@ -178,18 +211,25 @@ pub fn respond(h: &Mutex<Headless>, line: &str) -> Value {
     }
 }
 
-/// Serve JSON lines from `r` to `w` until EOF. Blank lines are ignored.
-pub fn serve_lines(h: &Mutex<Headless>, r: impl BufRead, mut w: impl Write) -> std::io::Result<()> {
-    for line in r.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let reply = respond(h, &line);
-        writeln!(w, "{reply}")?;
+/// Serve JSON lines from `r` to `w` until EOF. Blank lines are ignored. An over-long or non-UTF-8
+/// line gets an error reply and is skipped; the session (and its open documents) keeps serving.
+pub fn serve_lines(h: &Mutex<Headless>, mut r: impl BufRead, mut w: impl Write) -> std::io::Result<()> {
+    let mut line = String::new();
+    loop {
+        let (reply, unread_rest) = match read_bounded_line(&mut r, &mut line) {
+            Ok(LineRead::Eof) => return Ok(()),
+            Ok(LineRead::TooLong) => (json!({"id": null, "ok": false, "error": format!("request exceeds {MAX_REQUEST_BYTES} bytes")}), !line.ends_with('\n')),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => (json!({"id": null, "ok": false, "error": "request is not valid UTF-8"}), false),
+            Err(e) => return Err(e),
+            Ok(LineRead::Line) if line.trim().is_empty() => continue,
+            Ok(LineRead::Line) => (respond(h, &line), false),
+        };
+        write_reply(&mut w, &reply)?;
         w.flush()?;
+        if unread_rest {
+            discard_rest_of_line(&mut r)?;
+        }
     }
-    Ok(())
 }
 
 fn serve_tcp_connection(h: &Mutex<Headless>, stream: std::net::TcpStream, token: &str) -> std::io::Result<()> {
@@ -208,7 +248,7 @@ fn serve_tcp_connection(h: &Mutex<Headless>, stream: std::net::TcpStream, token:
                     "ok": false,
                     "error": format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
                 });
-                writeln!(out, "{reply}")?;
+                write_reply(&mut out, &reply)?;
                 out.flush()?;
                 return Ok(());
             }
@@ -222,7 +262,7 @@ fn serve_tcp_connection(h: &Mutex<Headless>, stream: std::net::TcpStream, token:
             authenticated = ok;
             reply
         };
-        writeln!(out, "{reply}")?;
+        write_reply(&mut out, &reply)?;
         out.flush()?;
         if !authenticated {
             return Ok(());
@@ -354,6 +394,200 @@ mod tests {
         assert!(r["bytes"].as_u64().unwrap() > 0);
         assert_eq!(photocraft_codecs::decode(&std::fs::read(&path).unwrap()).unwrap().dimensions(), (40, 20));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn background_jobs_list_wait_and_cancel() {
+        let mut h = Headless::new();
+        h.handle("doc.new", json!({"width": 600, "height": 400})).unwrap();
+        h.handle("engine.execute", json!({"command": "layer.new.layer"})).unwrap();
+        h.handle("engine.execute", json!({"command": "edit.fill", "params": {"color": "#808080"}})).unwrap();
+        // Default: waits, the result is the command's.
+        let r = h.handle("engine.execute", json!({"command": "filter.noise.addNoise", "params": {"amount": 20}})).unwrap();
+        assert!(r["filter"].is_object(), "{r}");
+        // wait: false returns a job id at once.
+        let r = h.handle("engine.execute", json!({"command": "filter.blur.gaussianBlur", "params": {"radius": 40}, "wait": false})).unwrap();
+        let job = r["job"].as_u64().unwrap();
+        let listed = h.handle("jobs.list", json!({})).unwrap();
+        assert!(listed["jobs"].as_array().unwrap().iter().any(|j| j["id"] == job), "{listed}");
+        // Wait for it via jobs.list (which applies finished jobs).
+        let t = std::time::Instant::now();
+        loop {
+            let l = h.handle("jobs.list", json!({})).unwrap();
+            let state = l["jobs"].as_array().unwrap().iter().find(|j| j["id"] == job).map(|j| j["state"].clone());
+            if state == Some(json!("done")) {
+                break;
+            }
+            assert!(t.elapsed().as_secs() < 60, "{l}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Cancel: a second job, cancelled at once, leaves the document unchanged.
+        let before = h.session.active().unwrap().doc.clone();
+        let r = h.handle("engine.execute", json!({"command": "filter.blur.gaussianBlur", "params": {"radius": 40}, "wait": false})).unwrap();
+        let job = r["job"].as_u64().unwrap();
+        h.handle("jobs.cancel", json!({"job": job})).unwrap();
+        assert!(h.handle("jobs.cancel", json!({"job": "nope"})).is_err());
+        let l = h.handle("jobs.list", json!({})).unwrap();
+        assert_eq!(l["jobs"].as_array().unwrap().iter().find(|j| j["id"] == job).unwrap()["state"], "cancelled");
+        assert!(std::sync::Arc::ptr_eq(&h.session.active().unwrap().doc, &before));
+    }
+
+    #[test]
+    fn batch_steps_can_start_background_jobs() {
+        let mut h = Headless::new();
+        h.handle("doc.new", json!({"width": 600, "height": 400})).unwrap();
+        let steps = json!([
+            {"command": "layer.new.layer"},
+            {"command": "edit.fill", "params": {"color": "#808080"}},
+            {"command": "filter.blur.gaussianBlur", "params": {"radius": 40}, "wait": false}
+        ]);
+        let r = h.handle("batch", json!({"steps": steps})).unwrap();
+        assert_eq!(r["completed"], 3, "{r}");
+        let job = r["results"][2]["result"]["job"].as_u64().unwrap_or_else(|| panic!("no job id: {r}"));
+        assert_eq!(r["results"][2]["result"]["pending"], true);
+        let listed = h.handle("jobs.list", json!({})).unwrap();
+        assert!(listed["jobs"].as_array().unwrap().iter().any(|j| j["id"] == job), "{listed}");
+        let t = std::time::Instant::now();
+        while h.session.jobs().iter().any(|j| j.id.0 == job) {
+            assert!(t.elapsed().as_secs() < 60);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            h.handle("jobs.list", json!({})).unwrap();
+        }
+    }
+
+    /// Regression (#503): a finished `wait: false` job was only applied by a later command or
+    /// `jobs.list`, so save, inspect, render and `session.list` still saw the document without it.
+    #[test]
+    fn every_request_sees_a_finished_background_job() {
+        let dir = std::env::temp_dir().join(format!("pc-rpc-job-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (before, after) = (dir.join("before.png"), dir.join("after.png"));
+        let mut h = Headless::trusted_local();
+        h.handle("doc.new", json!({"width": 64, "height": 48})).unwrap();
+        h.handle("engine.execute", json!({"command": "filter.noise.addNoise", "params": {"amount": 50}})).unwrap();
+        h.handle("doc.save", json!({"path": before.to_string_lossy()})).unwrap();
+        let render = |h: &mut Headless| h.handle("doc.render", json!({"maxSide": 0})).unwrap()["base64"].clone();
+        let unblurred = render(&mut h);
+        let revision = |h: &mut Headless| h.handle("session.list", json!({})).unwrap()["documents"][0]["revision"].clone();
+        let start = revision(&mut h);
+        h.handle("engine.execute", json!({"command": "filter.blur.gaussianBlur", "params": {"radius": 4}, "wait": false})).unwrap();
+        // Only reading requests from here on: no command and no `jobs.list`.
+        let t = std::time::Instant::now();
+        while revision(&mut h) == start {
+            assert!(t.elapsed().as_secs() < 60, "session.list never saw the finished job");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let history = h.handle("doc.inspect", json!({})).unwrap()["history"].clone();
+        assert_eq!(history.as_array().unwrap().last().unwrap(), "Gaussian Blur", "{history}");
+        h.handle("doc.save", json!({"path": after.to_string_lossy()})).unwrap();
+        let decode = |p: &std::path::Path| photocraft_codecs::decode(&std::fs::read(p).unwrap()).unwrap().to_rgba8();
+        assert_ne!(decode(&before), decode(&after), "the export holds the blur");
+        assert_ne!(render(&mut h), unblurred, "the preview holds the blur");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn automation_preview_rejects_oversized_full_size_and_numeric_wraparound() {
+        let mut h = Headless::new();
+        h.handle("doc.new", json!({"width": 2049, "height": 1})).unwrap();
+        for max in [json!(0), json!(2049), json!(u64::from(u32::MAX) + 1), json!(-1), json!(1.5)] {
+            assert!(h.handle("doc.render", json!({"maxSide": max})).is_err());
+        }
+        // A smaller preview still works, and rejection leaves the source document intact.
+        let rendered = h.handle("doc.render", json!({"maxSide": 32})).unwrap();
+        let png = base64::engine::general_purpose::STANDARD.decode(rendered["base64"].as_str().unwrap()).unwrap();
+        assert_eq!(photocraft_codecs::decode(&png).unwrap().dimensions(), (32, 1));
+        assert_eq!(h.session.active().unwrap().doc.size.width, 2049);
+    }
+
+    #[test]
+    fn stdio_rejects_oversized_frames_before_dispatch() {
+        let h = Mutex::new(Headless::new());
+        let input = " ".repeat(MAX_REQUEST_BYTES + 1);
+        let mut out = Vec::new();
+        serve_lines(&h, input.as_bytes(), &mut out).unwrap();
+        let reply: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("request exceeds"));
+        assert!(h.lock().unwrap().session.documents().is_empty());
+    }
+
+    /// Regression (#505): an over-long or non-UTF-8 line ended the stdio session, losing every
+    /// open document. Now it gets one error reply, the rest of the line is skipped (never
+    /// dispatched), and the next request is served.
+    #[test]
+    fn stdio_skips_a_rejected_line_and_keeps_the_session() {
+        let h = Mutex::new(Headless::new());
+        let mut input = b"{\"id\":1,\"method\":\"doc.new\",\"params\":{\"width\":8,\"height\":8}}\n".to_vec();
+        input.extend(" ".repeat(MAX_REQUEST_BYTES + 1).into_bytes());
+        input.extend(b"{\"id\":9,\"method\":\"doc.close\"}\n");
+        input.extend(b"\xff\xfe{\"id\":8,\"method\":\"doc.close\"}\n");
+        input.extend(b"{\"id\":2,\"method\":\"session.list\"}\n");
+        let mut out = Vec::new();
+        serve_lines(&h, input.as_slice(), &mut out).unwrap();
+        let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 4, "{replies:?}");
+        assert_eq!(replies[0]["ok"], true);
+        assert!(replies[1]["error"].as_str().unwrap().contains("request exceeds"), "{}", replies[1]);
+        assert!(replies[2]["error"].as_str().unwrap().contains("not valid UTF-8"), "{}", replies[2]);
+        assert_eq!(replies[3]["id"], 2);
+        assert_eq!(replies[3]["result"]["documents"].as_array().unwrap().len(), 1, "the document stays open");
+    }
+
+    #[test]
+    fn preview_rejection_precedes_output_file_creation() {
+        let root = std::env::temp_dir().join(format!("pc-preview-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = crate::AuthorizedWorkspace::new(None, Some(&root)).unwrap();
+        let mut h = Headless::with_workspace(workspace);
+        h.handle("doc.new", json!({"width": 16, "height": 8})).unwrap();
+        let result = h.handle("doc.render", json!({"maxSide": 2049, "path": "rejected.png"}));
+        assert!(result.unwrap_err().to_string().contains("preview side exceeds"));
+        assert!(!root.join("rejected.png").exists());
+        assert!(h.handle("doc.render", json!({"maxSide": 16, "path": "accepted.png"})).is_ok());
+        assert!(root.join("accepted.png").exists());
+        // Release directory capabilities before cleanup on Windows.
+        drop(h);
+        std::fs::remove_file(root.join("accepted.png")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn trusted_local_render_keeps_full_size_behavior() {
+        let mut h = Headless::trusted_local();
+        h.handle("doc.new", json!({"width": 2049, "height": 1})).unwrap();
+        let rendered = h.handle("doc.render", json!({"maxSide": 0})).unwrap();
+        let png = base64::engine::general_purpose::STANDARD.decode(rendered["base64"].as_str().unwrap()).unwrap();
+        assert_eq!(photocraft_codecs::decode(&png).unwrap().dimensions(), (2049, 1));
+    }
+
+    #[test]
+    fn methods_lists_the_job_methods_and_every_listed_name_is_served() {
+        let mut h = Headless::new();
+        let listed = h.handle("methods", Value::Null).unwrap();
+        let listed: Vec<&str> = listed.as_array().unwrap().iter().map(|m| m.as_str().unwrap()).collect();
+        assert_eq!(listed, METHODS);
+        // The job methods `engine.execute {"wait": false}` depends on are discoverable (#414).
+        assert!(listed.contains(&"jobs.list") && listed.contains(&"jobs.cancel"));
+        for m in METHODS {
+            if let Err(e) = h.handle(m, Value::Null) {
+                assert!(!e.to_string().contains("unknown method"), "{m} is listed but not served: {e}");
+            }
+        }
+        assert!(h.handle("jobs.nope", Value::Null).unwrap_err().to_string().contains("unknown method"));
+    }
+
+    #[test]
+    fn batch_response_budget_stops_later_steps_even_when_stop_on_error_is_false() {
+        let mut h = Headless::new();
+        let mut steps = vec![json!({"command": "command.list"}); MAX_BATCH_STEPS - 1];
+        steps.push(json!({"command": "file.new", "params": {"width": 8, "height": 8}}));
+        let result = h.batch(&json!({"steps": steps, "stopOnError": false})).unwrap();
+        assert_eq!(result["failed"], 1);
+        assert!(result["results"].as_array().unwrap().last().unwrap()["error"].as_str().unwrap().contains("batch response budget exceeded"));
+        assert!(h.session.documents().is_empty(), "later edit must not execute after the quota is exhausted");
+        assert!(crate::budgets::json_bytes(&result).is_ok());
+        assert!(h.handle("methods", Value::Null).is_ok());
     }
 
     #[test]

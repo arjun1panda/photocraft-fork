@@ -10,7 +10,10 @@
 //! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 layerpx x y  # each layer's pixel
 //! cargo run --release -p photocraft-io --example oracle_diff -- corpus/psd             # every file: max err, bad %, PASS/DIFF
 //! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 dump prefix # raw f32 planes for offline fitting
+//! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 bylayer    # max error around each layer
+//! SCALE=4 …                                                                         # upscale the png
 //! HIDE_ADJ=1 …                                                                        # adjustment layers hidden
+//! ONLY="name,name" …                                                                  # only these top-level layers (+ the bottom one)
 //! DUMP_FX=1 …                                                                          # raw effects descriptors
 //! ```
 fn main() {
@@ -35,6 +38,14 @@ fn main() {
             }
         }
         hide(&mut imp.document.layers);
+    }
+    if let Some(keep) = std::env::var_os("ONLY") {
+        // Hide every top-level layer but the bottom one and those named in ONLY (comma-separated).
+        let keep = keep.to_string_lossy().to_string();
+        let names: Vec<&str> = keep.split(',').collect();
+        for l in imp.document.layers.iter_mut().skip(1) {
+            l.visible = names.contains(&l.name.as_str());
+        }
     }
     let doc = &imp.document;
     println!("mode {:?} depth {:?} layers {} warnings {:?} light {:?}", doc.mode, doc.depth, doc.layer_count(), imp.warnings, doc.global_light);
@@ -79,7 +90,21 @@ fn main() {
             println!("    alpha bounds ({x0},{y0})-({x1},{y1})");
         }
         if let photocraft_doc::LayerContent::Shape(sh) = &l.content {
-            println!("    shape path bounds {:?}", sh.path.control_bounds());
+            println!(
+                "    shape path bounds {:?} subpaths {} rule {:?} inverted {} fill {} stroke {} outline {}",
+                sh.path.control_bounds(),
+                sh.path.subpaths.len(),
+                sh.path.fill_rule,
+                sh.path.inverted,
+                sh.fill.is_some(),
+                sh.stroke.is_some(),
+                photocraft_compose::effect_outline(l).is_some()
+            );
+            if std::env::var_os("PATHS").is_some() {
+                for s in &sh.path.subpaths {
+                    println!("      subpath {:?} closed {} knots {:?}", s.op, s.closed, s.knots.iter().map(|k| (k.anchor.x, k.anchor.y)).collect::<Vec<_>>());
+                }
+            }
         }
         if let Some(vm) = &l.vector_mask {
             println!("    vector mask bounds {:?}", vm.path.control_bounds());
@@ -120,6 +145,19 @@ fn main() {
                     walk(&vd.descriptor, 3, &mut out);
                     for l in out.iter().filter(|l| !l.trim_start().starts_with("Clrs") && !l.trim_start().starts_with("Trns")) {
                         println!("{l}");
+                    }
+                }
+            }
+            if k == b"TySh"
+                && let Some(Ok((vd, _))) = v.get(52..).map(photocraft_psd::descriptor::VersionedDescriptor::parse_prefix)
+            {
+                // Text bounds (text space) and the transform.
+                let t: Vec<f64> = (0..6).map(|i| f64::from_be_bytes(v[2 + i * 8..10 + i * 8].try_into().unwrap())).collect();
+                println!("    TySh transform {t:?}");
+                for key in ["bounds", "boundingBox"] {
+                    if let Some(photocraft_psd::descriptor::Value::Descriptor(d)) = vd.descriptor.get(key) {
+                        let n: Vec<String> = d.items.iter().map(|(k, v)| format!("{}={v:?}", String::from_utf8_lossy(k.as_bytes()))).collect();
+                        println!("    TySh {key}: {}", n.join(" "));
                     }
                 }
             }
@@ -173,7 +211,7 @@ fn main() {
             }
         }
         for rec in file.layers() {
-            println!("-- layer {:?}", String::from_utf8_lossy(&rec.name));
+            println!("-- layer {:?} rect {:?}", String::from_utf8_lossy(&rec.name), rec.rect);
             if let Some(b) = rec.block(b"lmfx").or(rec.block(b"lfx2")).or(rec.block(b"lfxs"))
                 && let Ok((vd, _)) = photocraft_psd::descriptor::VersionedDescriptor::parse_prefix(&b.data[4..])
             {
@@ -203,6 +241,20 @@ fn main() {
                 }
             }
         }
+        // SCALE=n: nearest-neighbour upscale (small files).
+        let k: usize = std::env::var("SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1).clamp(1, 16);
+        let (img, w, h) = if k > 1 {
+            let mut big = vec![0u8; w * 3 * k * h * k * 4];
+            for y in 0..h * k {
+                for x in 0..w * 3 * k {
+                    let (s, d) = (((y / k) * w * 3 + x / k) * 4, (y * w * 3 * k + x) * 4);
+                    big[d..d + 4].copy_from_slice(&img[s..s + 4]);
+                }
+            }
+            (big, w * k, h * k)
+        } else {
+            (img, w, h)
+        };
         let image =
             photocraft_codecs::Image::from_raw((w * 3) as u32, h as u32, photocraft_codecs::ChannelLayout::Rgba, photocraft_codecs::SampleType::U8, img)
                 .unwrap();
@@ -264,6 +316,46 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(3).as_deref() == Some("bylayer") {
+        // Max error and bad-pixel count inside each layer's bounds grown by its effects' reach
+        // (regions overlap; a quick way to tell which layer or effect is off).
+        let (w, h) = (doc.size.width as i32, doc.size.height as i32);
+        for (_, _, l) in doc.walk() {
+            let Some(sf) = l.surface() else { continue };
+            let cb = sf.content_bounds();
+            let mut b = photocraft_geom::Rect::new(i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for y in cb.y0..cb.y1 {
+                for x in cb.x0..cb.x1 {
+                    let p = sf.pixel(x, y);
+                    if p[p.len() - 1] > 0.0 {
+                        b = photocraft_geom::Rect::new(b.x0.min(x), b.y0.min(y), b.x1.max(x + 1), b.y1.max(y + 1));
+                    }
+                }
+            }
+            if b.x0 > b.x1 {
+                continue;
+            }
+            let m = photocraft_compose::effects::margin(l);
+            let r = photocraft_geom::Rect::new((b.x0 - m).max(0), (b.y0 - m).max(0), (b.x1 + m).min(w), (b.y1 + m).min(h));
+            let (mut worst, mut at, mut bad) = (0.0f32, (0, 0), 0usize);
+            for y in r.y0..r.y1 {
+                for x in r.x0..r.x1 {
+                    let i = (y * w + x) as usize;
+                    let (a, b) = (ours[i], merged[i]);
+                    let d = (0..3).map(|c| (a[c] * a[3] - b[c] * b[3]).abs()).fold((a[3] - b[3]).abs(), f32::max);
+                    if d > 2.0 / 255.0 {
+                        bad += 1;
+                    }
+                    if d > worst {
+                        (worst, at) = (d, (x, y));
+                    }
+                }
+            }
+            let fx: Vec<&str> = l.effects.items.iter().filter(|e| e.enabled()).map(|e| e.label()).collect();
+            println!("{:<32} {:>6.1} at {:?} bad {:>6}  {:?} {:?}", l.name, worst * 255.0, at, bad, l.blend, fx);
+        }
+        return;
+    }
     if std::env::args().nth(3).as_deref() == Some("worst") {
         // The N worst pixels (premultiplied max channel error), with coordinates.
         let w = doc.size.width as usize;
@@ -289,6 +381,43 @@ fn main() {
         for x in (x0..x1).step_by(((x1 - x0) / 20).max(1)) {
             let (a, b) = (ours[y * w + x], merged[y * w + x]);
             println!("x={x:5} ours {:?} ps {:?}", a.map(|v| (v * 1000.0).round() / 1000.0), b.map(|v| (v * 1000.0).round() / 1000.0));
+        }
+        return;
+    }
+    if std::env::args().nth(3).as_deref() == Some("solve") {
+        // solve layer-name x0 y0 x1 y1: per pixel the layer's content alpha `l`, its shape's path
+        // coverage `cov`, Photoshop's alpha `A` and the alpha `s` an effect beneath the layer
+        // would need (A = s + l (1 - s)) over a transparent backdrop.
+        let name = std::env::args().nth(4).expect("layer name");
+        let a: Vec<i32> = (5..9).map(|i| std::env::args().nth(i).and_then(|s| s.parse().ok()).unwrap_or(0)).collect();
+        let w = doc.size.width as usize;
+        let l = doc.walk().into_iter().map(|t| t.2).find(|l| l.name == name).expect("layer");
+        let r = photocraft_geom::Rect::new(a[0], a[1], a[2], a[3]);
+        let cov = match &l.content {
+            photocraft_doc::LayerContent::Shape(sh) => photocraft_vector::path_coverage(&sh.path, r),
+            _ => vec![0.0; r.width() as usize * r.height() as usize],
+        };
+        for y in r.y0..r.y1 {
+            for x in r.x0..r.x1 {
+                let la = l.surface().map_or(0.0, |s| s.pixel(x, y)[3]);
+                let c = cov[((y - r.y0) * r.width() as i32 + x - r.x0) as usize];
+                let p = merged[y as usize * w + x as usize];
+                let o = ours[y as usize * w + x as usize];
+                let s = if la < 1.0 { (p[3] - la) / (1.0 - la) } else { f32::NAN };
+                println!("({x:3},{y:3}) l {la:.3} cov {c:.3} A {:.3} ours {:.3} s {s:.3} ps {:?}", p[3], o[3], p.map(|v| (v * 255.0).round()));
+            }
+        }
+        return;
+    }
+    if std::env::args().nth(3).as_deref() == Some("line") {
+        // line x0 y0 x1 y1: every pixel on the segment, straight RGBA 0-255, ours | ps.
+        let w = doc.size.width as usize;
+        let a: Vec<i64> = (4..8).map(|i| std::env::args().nth(i).and_then(|s| s.parse().ok()).unwrap_or(0)).collect();
+        let n = (a[2] - a[0]).abs().max((a[3] - a[1]).abs()).max(1);
+        for k in 0..=n {
+            let (x, y) = ((a[0] + (a[2] - a[0]) * k / n) as usize, (a[1] + (a[3] - a[1]) * k / n) as usize);
+            let (o, p) = (ours[y * w + x], merged[y * w + x]);
+            println!("({x:4},{y:4}) ours {:?} ps {:?}", o.map(|v| (v * 255.0).round()), p.map(|v| (v * 255.0).round()));
         }
         return;
     }

@@ -47,6 +47,9 @@ fn always(_: &Session) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Largest stroke coordinate accepted (a few times the largest document side, 300 000 px).
+pub(crate) const MAX_COORD: f64 = 1_000_000.0;
+
 /// Parse `points`: arrays `[x, y, pressure?, tiltX?, tiltY?, rotation?, timeMs?, wheel?]` or
 /// objects `{"x":…, "y":…, "pressure":…, "tiltX":…, …, "time":…}`.
 pub fn parse_points(p: &Value, cmd: &str) -> Result<Vec<StrokePoint>> {
@@ -71,12 +74,21 @@ pub fn parse_points(p: &Value, cmd: &str) -> Result<Vec<StrokePoint>> {
     if pts.is_empty() {
         return Err(bad(cmd, "`points` is empty"));
     }
+    // A stroke runs dab by dab along its length: an absurd coordinate would mean billions of dabs.
+    if pts.iter().any(|q| !(q.x.abs() <= MAX_COORD && q.y.abs() <= MAX_COORD)) {
+        return Err(bad(cmd, format!("point coordinates must be finite and within ±{MAX_COORD}")));
+    }
     Ok(pts)
 }
 
 /// Deep-merge `patch` into `base` (objects merge key by key; anything else replaces).
 fn merge(base: &mut Value, patch: &Value) {
     match (base, patch) {
+        // A different variant of an externally tagged enum (`{"tile":…}` → `{"procedural":…}`)
+        // replaces the old one instead of merging into a two-variant object.
+        (Value::Object(b), Value::Object(p)) if b.len() == 1 && p.len() == 1 && b.keys().next() != p.keys().next() => {
+            *b = p.clone();
+        }
         (Value::Object(b), Value::Object(p)) => {
             for (k, v) in p {
                 match b.get_mut(k) {
@@ -93,9 +105,61 @@ fn merge(base: &mut Value, patch: &Value) {
 
 /// Apply a JSON brush patch onto a brush.
 pub fn merge_brush(base: &BrushSettings, patch: &Value, cmd: &str) -> Result<BrushSettings> {
-    let mut v = serde_json::to_value(base).map_err(|e| bad(cmd, e.to_string()))?;
+    // Bitmaps the patch doesn't touch (sampled tips, pattern tiles: up to megabytes of base64) skip
+    // the JSON round trip, so a Brush Settings slider on an imported tip stays cheap.
+    let touches = |path: &[&str]| {
+        let mut v = patch;
+        for k in path {
+            match v.get(k) {
+                Some(x) => v = x,
+                // A non-object on the way replaces the whole section.
+                None => return !v.is_object(),
+            }
+        }
+        true
+    };
+    let mut light = base.clone();
+    let tip = (!touches(&["tip"])).then(|| std::mem::take(&mut light.tip));
+    let dual_tip = (!touches(&["dualBrush", "tip"])).then(|| std::mem::take(&mut light.dual_brush.tip));
+    let pattern = (!touches(&["texture", "pattern"])).then(|| std::mem::take(&mut light.texture.pattern));
+    let mut v = serde_json::to_value(&light).map_err(|e| bad(cmd, e.to_string()))?;
     merge(&mut v, patch);
-    serde_json::from_value(v).map_err(|e| bad(cmd, format!("invalid brush: {e}")))
+    let mut out: BrushSettings = serde_json::from_value(v).map_err(|e| bad(cmd, format!("invalid brush: {e}")))?;
+    if let Some(t) = tip {
+        out.tip = t;
+    }
+    if let Some(t) = dual_tip {
+        out.dual_brush.tip = t;
+    }
+    if let Some(p) = pattern {
+        out.texture.pattern = p;
+    }
+    Ok(out)
+}
+
+/// Rejects brush sizes and Scatter amounts outside their documented ranges, before a brush is
+/// stored or painted with.
+pub(crate) fn validate_brush(brush: &BrushSettings, cmd: &str) -> Result<()> {
+    let max = photocraft_paint::MAX_BRUSH_SIZE;
+    if !brush.size.is_finite() || brush.size > max {
+        return Err(bad(cmd, format!("brush size must be finite and at most {max} px")));
+    }
+    if brush.dual_brush.enabled && (!brush.dual_brush.size.is_finite() || brush.dual_brush.size > max) {
+        return Err(bad(cmd, format!("dual brush size must be finite and at most {max} px")));
+    }
+    // Scatter may exceed 1 (100 %) but not the 1000 % maximum: a huge amount pushed dab centres to
+    // infinity (#977). `{:?}` keeps 1e38 short and shows infinity as `inf`.
+    let scatter_max = photocraft_paint::MAX_SCATTER;
+    let in_range = |v: f32| (0.0..=scatter_max).contains(&v);
+    let sc = brush.scattering.scatter.jitter;
+    if brush.scattering.enabled && !in_range(sc) {
+        return Err(bad(cmd, format!("scatter amount {sc:?} is out of range: it must be between 0 and {scatter_max} (1000 %)")));
+    }
+    let ds = brush.dual_brush.scatter;
+    if brush.dual_brush.enabled && !in_range(ds) {
+        return Err(bad(cmd, format!("dual brush scatter amount {ds:?} is out of range: it must be between 0 and {scatter_max} (1000 %)")));
+    }
+    Ok(())
 }
 
 fn find_preset<'a>(s: &'a Session, name: &str, cmd: &str) -> Result<&'a BrushPreset> {
@@ -107,7 +171,7 @@ fn find_preset<'a>(s: &'a Session, name: &str, cmd: &str) -> Result<&'a BrushPre
 pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings> {
     let mut b = s.tools.brush.clone();
     if let Some(name) = p.get("preset").and_then(Value::as_str) {
-        b = find_preset(s, name, cmd)?.brush.clone().with_protected_texture(&s.tools.brush);
+        b = find_preset(s, name, cmd)?.brush.clone().picked_over(&s.tools.brush);
     }
     if let Some(patch) = p.get("brush").filter(|v| v.is_object()) {
         b = merge_brush(&b, patch, cmd)?;
@@ -137,6 +201,7 @@ pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings>
         Some(v) => v,
         None => photocraft_paint::rng::seed_from_bytes(p.get("points").map(|v| v.to_string()).unwrap_or_default().as_bytes()),
     };
+    validate_brush(&b, cmd)?;
     Ok(b)
 }
 
@@ -176,6 +241,7 @@ fn erase_locked(brush: &mut BrushSettings, lock: bool, bg: [f32; 4]) {
 fn stroke_with(s: &mut Session, p: &Value, label: &str, brush: BrushSettings, pts: Vec<StrokePoint>, auto_erase: bool) -> Result<Value> {
     let bg = s.tools.background;
     let fg = brush.color;
+    let symmetry = s.active().and_then(|st| st.symmetry_path.clone());
     let (id, brush, zoom) = stroke_target(s, p, brush)?;
     let dmg = s.edit(label, |doc, _| {
         let sel = doc.selection.clone();
@@ -183,15 +249,52 @@ fn stroke_with(s: &mut Session, p: &Value, label: &str, brush: BrushSettings, pt
         let mut brush = brush;
         erase_locked(&mut brush, lock, bg);
         if auto_erase {
-            // Pencil Auto Erase: starting on foreground-coloured pixels paints the background colour.
-            let c = surf.rgba(pts[0].x.floor() as i32, pts[0].y.floor() as i32);
-            if c[3] > 0.0 && (0..3).all(|i| (c[i] - fg[i]).abs() < 1.5 / 255.0) {
-                brush.color = bg;
-            }
+            apply_auto_erase(&mut brush, surf, pts.first(), fg, bg);
         }
-        Ok(render_stroke(surf, &brush, &pts, sel.as_ref(), lock, zoom))
+        let damage = if let Some(axis) = &symmetry {
+            let reflected = axis.reflect_points(&pts);
+            if crate::symmetry_cmds::SymmetryAxis::has_distinct_mirror(&pts, &reflected) {
+                let pre = surf.clone();
+                let mut original = StrokeRenderer::new(&brush, Some(surf.format()), zoom);
+                original.push(&pts);
+                original.finish();
+                let mut mirror = StrokeRenderer::new(&brush, Some(surf.format()), zoom);
+                mirror.push(&reflected);
+                mirror.finish();
+                original.composite_union(&mirror, &pre, surf, sel.as_ref(), lock)
+            } else {
+                render_stroke(surf, &brush, &pts, sel.as_ref(), lock, zoom)
+            }
+        } else {
+            render_stroke(surf, &brush, &pts, sel.as_ref(), lock, zoom)
+        };
+        Ok(damage)
     })?;
     Ok(damage_json(s, dmg))
+}
+
+/// Pencil Auto Erase: a stroke that starts on a pixel of the foreground colour paints the
+/// background colour instead (Photoshop).
+fn apply_auto_erase(brush: &mut BrushSettings, surf: &Surface, start: Option<&StrokePoint>, fg: [f32; 4], bg: [f32; 4]) {
+    let Some(p0) = start else { return };
+    let c = surf.rgba(p0.x.floor() as i32, p0.y.floor() as i32);
+    if c[3] > 0.0 && (0..3).all(|i| (c[i] - fg[i]).abs() < 1.5 / 255.0) {
+        brush.color = bg;
+    }
+}
+
+/// The Pencil's brush: the session brush made aliased (every pixel fully painted or untouched,
+/// dabs on the pixel grid), hard and at full flow, with the options-bar mode.
+fn pencil_brush(s: &Session, p: &Value) -> Result<BrushSettings> {
+    let mut brush = with_blend_mode(resolve_brush(s, p, "paint.pencil")?, p);
+    brush.aliased = true;
+    if num(p, "hardness").is_none() {
+        brush.hardness = 1.0;
+    }
+    if num(p, "flow").is_none() {
+        brush.flow = 1.0;
+    }
+    Ok(brush)
 }
 
 /// Applies the options-bar blend `mode` to a brush. `"mode"` accepts any blend-mode name
@@ -222,52 +325,106 @@ pub struct LiveStroke {
     /// Jitter seed to pass to `paint.stroke`.
     pub seed: u64,
     renderer: StrokeRenderer,
+    mirror: Option<(crate::symmetry_cmds::SymmetryAxis, StrokeRenderer)>,
+    mirror_distinct: bool,
     pre: Surface,
     sel: Option<Surface>,
     lock: bool,
     layer: Option<photocraft_doc::LayerId>,
     params: Value,
+    /// Where the doc shows the stroke's end as finishing it would draw it (see `push`).
+    tail: Rect,
 }
 
 impl LiveStroke {
     /// Start from `paint.stroke` params; their `points` are rendered.
     pub fn begin(s: &Session, p: &Value) -> Result<Self> {
+        Self::begin_with(s, "paint.stroke", p)
+    }
+
+    /// Start a live stroke of `cmd`: `paint.stroke` (the Brush and Eraser) or `paint.pencil`.
+    /// Committing `cmd` with the same params and `"seed": live.seed` gives the same pixels.
+    pub fn begin_with(s: &Session, cmd: &str, p: &Value) -> Result<Self> {
         has_paintable(s).map_err(EngineError::Other)?;
-        let pts = parse_points(p, "paint.stroke")?;
-        let brush = with_blend_mode(resolve_brush(s, p, "paint.stroke")?, p);
-        let seed = brush.seed;
+        let pts = parse_points(p, cmd)?;
+        let pencil = match cmd {
+            "paint.stroke" => false,
+            "paint.pencil" => true,
+            other => return Err(bad(other, "live strokes are `paint.stroke` or `paint.pencil`")),
+        };
+        let brush = if pencil { pencil_brush(s, p)? } else { with_blend_mode(resolve_brush(s, p, cmd)?, p) };
+        let (seed, fg) = (brush.seed, brush.color);
         let (layer, mut brush, zoom) = stroke_target(s, p, brush)?;
         let mut doc = (*s.active().ok_or(EngineError::NoDocument)?.doc).clone();
         let sel = doc.selection.clone();
         let (surf, lock) = crate::channel_cmds::target_surface(&mut doc, layer, p)?;
         erase_locked(&mut brush, lock, s.tools.background);
+        if pencil && flag(p, "autoErase", false) {
+            apply_auto_erase(&mut brush, surf, pts.first(), fg, s.tools.background);
+        }
         let renderer = StrokeRenderer::new(&brush, Some(surf.format()), zoom);
+        let mirror = s.active().and_then(|st| st.symmetry_path.clone()).map(|axis| (axis, StrokeRenderer::new(&brush, Some(surf.format()), zoom)));
         let pre = surf.clone();
-        let mut live = Self { doc: std::sync::Arc::new(doc), seed, renderer, pre, sel, lock, layer, params: p.clone() };
+        let mut live =
+            Self { doc: std::sync::Arc::new(doc), seed, renderer, mirror, mirror_distinct: false, pre, sel, lock, layer, params: p.clone(), tail: Rect::EMPTY };
         live.push(&pts)?;
         Ok(live)
     }
 
     /// Everything the stroke has touched so far.
     pub fn bounds(&self) -> Rect {
-        self.renderer.bounds()
+        let bounds = self.renderer.bounds().union(&self.tail);
+        if self.mirror_distinct { self.mirror.as_ref().map_or(bounds, |(_, renderer)| bounds.union(&renderer.bounds())) } else { bounds }
     }
 
-    /// Render more points; returns the rectangle that changed.
+    /// Render more points; returns the rectangle that changed. The doc shows the stroke as
+    /// committing it now would: with smoothing, the brush lags behind the pointer and catches up
+    /// when the stroke ends, so that catch-up tail is drawn too (and redrawn on every step), and
+    /// nothing new appears on release.
     pub fn push(&mut self, pts: &[StrokePoint]) -> Result<Rect> {
         self.renderer.push(pts);
+        if let Some((axis, mirror)) = &mut self.mirror {
+            let reflected = axis.reflect_points(pts);
+            self.mirror_distinct |= crate::symmetry_cmds::SymmetryAxis::has_distinct_mirror(pts, &reflected);
+            mirror.push(&reflected);
+        }
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
-        Ok(self.renderer.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false))
+        if let (true, Some((_, mirror))) = (self.mirror_distinct, &mut self.mirror) {
+            // Preview the finished strokes through one coverage buffer. Shared axis pixels
+            // therefore receive the brush opacity once, exactly like the final commit.
+            let old = self.tail;
+            let mut original_preview = self.renderer.clone();
+            original_preview.finish();
+            let mut mirror_preview = mirror.clone();
+            mirror_preview.finish();
+            let bounds = original_preview.bounds().union(&mirror_preview.bounds()).union(&old);
+            if !bounds.is_empty() {
+                surf.write_region(bounds, &self.pre.read_region(bounds));
+            }
+            let damage = original_preview.composite_union(&mirror_preview, &self.pre, surf, self.sel.as_ref(), self.lock);
+            self.tail = bounds;
+            return Ok(damage.union(&bounds));
+        }
+        let mut dmg = Rect::EMPTY;
+        let old = std::mem::replace(&mut self.tail, Rect::EMPTY);
+        if !old.is_empty() {
+            // Back to the stroke without the previous tail.
+            surf.write_region(old, &self.pre.read_region(old));
+            self.renderer.mark_dirty(old);
+            dmg = old;
+        }
+        dmg = dmg.union(&self.renderer.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false));
+        if let Some(mut tail) = self.renderer.tail_preview() {
+            self.tail = tail.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false);
+            dmg = dmg.union(&self.tail);
+        }
+        Ok(dmg)
     }
 }
 
 fn pencil(s: &mut Session, p: &Value) -> Result<Value> {
     let pts = parse_points(p, "paint.pencil")?;
-    let mut brush = with_blend_mode(resolve_brush(s, p, "paint.pencil")?, p);
-    brush.aliased = true;
-    if num(p, "hardness").is_none() {
-        brush.hardness = 1.0;
-    }
+    let brush = pencil_brush(s, p)?;
     let label = if brush.erase { "Eraser" } else { "Pencil" };
     stroke_with(s, p, label, brush, pts, flag(p, "autoErase", false))
 }
@@ -280,8 +437,16 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "paint.mixerBrush";
     let pts = parse_points(p, cmd)?;
     let brush = resolve_brush(s, p, cmd)?;
-    let m = MixerSettings { wet: pct(p, "wet", 50.0), load: pct(p, "load", 50.0), mix: pct(p, "mix", 50.0), flow: pct(p, "flow", 100.0) };
-    let sample_all = flag(p, "sampleAllLayers", false);
+    // The brush's Mixer Brush options, overridden by the scalar params.
+    let bm = &brush.mixer;
+    let m = MixerSettings {
+        wet: pct(p, "wet", bm.wet * 100.0),
+        load: pct(p, "load", bm.load * 100.0),
+        mix: pct(p, "mix", bm.mix * 100.0),
+        flow: pct(p, "flow", bm.flow * 100.0),
+        sample_all_layers: flag(p, "sampleAllLayers", bm.sample_all_layers),
+    };
+    let sample_all = m.sample_all_layers;
     let (clean, load_after) = (flag(p, "cleanAfterStroke", true), flag(p, "loadAfterStroke", true));
     let mut state = s.tools.mixer.clone();
     if load_after || state.reservoir.is_none() {
@@ -335,9 +500,8 @@ fn color_replacement(s: &mut Session, p: &Value) -> Result<Value> {
     let stroke = Stroke { brush, points: pts };
     let dmg = s.edit("Color Replacement", |doc, _| {
         let sel = doc.selection.clone();
-        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        let lock = l.locks.transparency;
-        let surf = paint_surface(l, &json!({}))?;
+        let lock = doc.effective_locks(id).transparency;
+        let surf = paint_surface(doc, id, &json!({}))?;
         Ok(apply_color_replacement(surf, &stroke, &rs, sel.as_ref(), lock))
     })?;
     Ok(damage_json(s, dmg))
@@ -466,11 +630,11 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "name": name, "width": tw, "height": th }))
 }
 
-fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
+pub(crate) fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "tools.setBrush";
     let mut b = s.tools.brush.clone();
     if let Some(name) = p.get("preset").and_then(Value::as_str) {
-        b = find_preset(s, name, cmd)?.brush.clone().with_protected_texture(&s.tools.brush);
+        b = find_preset(s, name, cmd)?.brush.clone().picked_over(&s.tools.brush);
     }
     if flag(p, "reset", false) {
         b = BrushSettings::default();
@@ -482,12 +646,95 @@ fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
         }
         if let Some(inner) = o.remove("brush") {
             let tmp = merge_brush(&b, &inner, cmd)?;
+            // Before the second merge: a non-finite value would serialise as `null` there and be
+            // reported as a type error instead of naming the value (#977).
+            validate_brush(&tmp, cmd)?;
             b = tmp;
         }
     }
     b = merge_brush(&b, &patch, cmd)?;
-    s.tools.brush = b;
+    validate_brush(&b, cmd)?;
+    let before = std::mem::replace(&mut s.tools.brush, b);
+    // A coalesced gesture (one slider drag) journals as one call: remember the brush it started from.
+    let key = p.get("coalesce").and_then(Value::as_str).filter(|_| p.get("preset").is_none() && p.get("reset").is_none());
+    let continuing = |s: &Session, k: &str| {
+        s.tools.brush_gesture.as_ref().is_some_and(|(g, _)| g == k)
+            && s.journal.last().is_some_and(|(id, lp)| id == cmd && lp.get("coalesce").and_then(Value::as_str) == Some(k))
+    };
+    match key {
+        Some(k) if continuing(s, k) => {}
+        Some(k) => s.tools.brush_gesture = Some((k.to_string(), before)),
+        None => s.tools.brush_gesture = None,
+    }
     Ok(brush_json(&s.tools.brush))
+}
+
+/// The brush as JSON with the bitmaps (sampled tips, pattern tiles) that `skip` names replaced by
+/// placeholders: they can be megabytes of base64, and skipped ones are equal on both sides.
+fn light_json(b: &BrushSettings, skip: (bool, bool, bool)) -> Value {
+    let mut c = b.clone();
+    if skip.0 {
+        c.tip = TipShape::Round;
+    }
+    if skip.1 {
+        c.dual_brush.tip = TipShape::Round;
+    }
+    if skip.2 {
+        c.texture.pattern = photocraft_paint::Pattern::default();
+    }
+    serde_json::to_value(&c).unwrap_or(Value::Null)
+}
+
+/// Fields of `new` that differ from `old`, nested objects diffed key by key: the minimal
+/// `tools.setBrush` `brush` patch that turns `old` into `new` (`{}` when nothing changed).
+pub fn brush_patch(old: &BrushSettings, new: &BrushSettings) -> Value {
+    let skip = (old.tip == new.tip, old.dual_brush.tip == new.dual_brush.tip, old.texture.pattern == new.texture.pattern);
+    fn diff(a: &Value, b: &Value) -> Option<Value> {
+        match (a, b) {
+            (Value::Object(ao), Value::Object(bo)) => {
+                let mut out = serde_json::Map::new();
+                for (k, bv) in bo {
+                    match ao.get(k) {
+                        Some(av) => {
+                            if let Some(d) = diff(av, bv) {
+                                out.insert(k.clone(), d);
+                            }
+                        }
+                        None => {
+                            out.insert(k.clone(), bv.clone());
+                        }
+                    }
+                }
+                (!out.is_empty()).then_some(Value::Object(out))
+            }
+            // Enums with payloads (tips, patterns) are replaced whole.
+            _ => (a != b).then(|| b.clone()),
+        }
+    }
+    diff(&light_json(old, skip), &light_json(new, skip)).unwrap_or_else(|| json!({}))
+}
+
+/// Journal hook ([`Session::execute`]): consecutive `tools.setBrush` calls with the same
+/// `coalesce` key (one drag in the options bar or the Brush Settings panel) are one journal
+/// entry, the patch from the brush before the gesture to the brush now. Returns true when the
+/// call was folded into the previous entry.
+pub fn coalesce_journal(s: &mut Session, id: &str, params: &Value) -> bool {
+    if id != "tools.setBrush" {
+        return false;
+    }
+    let Some(key) = params.get("coalesce").and_then(Value::as_str) else { return false };
+    let Some((gk, start)) = s.tools.brush_gesture.as_ref() else { return false };
+    if gk != key {
+        return false;
+    }
+    let patch = brush_patch(start, &s.tools.brush);
+    match s.journal.last_mut() {
+        Some((last, lp)) if last == id && lp.get("coalesce").and_then(Value::as_str) == Some(key) => {
+            *lp = json!({ "brush": patch, "coalesce": key });
+            true
+        }
+        _ => false,
+    }
 }
 
 macro_rules! spec {
@@ -502,7 +749,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "paint.pencil",
             "Pencil",
-            r##"{"points":[[x,y,pressure?,tiltX?,tiltY?,rotation?,timeMs?,wheel?],…],"brush":{…}?,"preset":name?,"size":px?,"opacity":0..1?,"color":"#rrggbb"?=foreground,"mode":"normal|multiply|screen|…"="normal","erase":bool?,"autoErase":bool=false,"seed":u64?,"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
+            r##"{"points":[[x,y,pressure?,tiltX?,tiltY?,rotation?,timeMs?,wheel?],…],"brush":{…}?,"preset":name?,"size":0.5..5000 px?,"opacity":0..1?,"color":"#rrggbb"?=foreground,"mode":"normal|multiply|screen|…"="normal","erase":bool?,"autoErase":bool=false,"seed":u64?,"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
             has_paintable,
             pencil,
             true
@@ -510,7 +757,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "paint.mixerBrush",
             "Mixer Brush",
-            r##"{"points":[…],"brush":{…}?,"preset":name?,"size":px?,"wet":0..100=50,"load":0..100=50,"mix":0..100=50,"flow":0..100=100,"color":"#rrggbb"?=foreground,"sampleAllLayers":bool=false,"cleanAfterStroke":bool=true,"loadAfterStroke":bool=true,"seed":u64?}"##,
+            r##"{"points":[…],"brush":{…}?,"preset":name?,"size":0.5..5000 px?,"wet":0..100=brush.mixer.wet,"load":0..100=brush.mixer.load,"mix":0..100=brush.mixer.mix,"flow":0..100=brush.mixer.flow,"color":"#rrggbb"?=foreground,"sampleAllLayers":bool=brush.mixer.sampleAllLayers,"cleanAfterStroke":bool=true,"loadAfterStroke":bool=true,"seed":u64?}"##,
             has_paintable,
             mixer_brush,
             true

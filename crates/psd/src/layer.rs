@@ -176,6 +176,21 @@ pub struct LayerMask {
     pub real: Option<RealMask>,
     /// Remaining bytes (the 2 padding bytes of the 20-byte form, etc.).
     pub trailing: Vec<u8>,
+    /// When both are present, the real-mask fields come before the mask parameters. Photoshop
+    /// writes this order (the published spec lists the parameters first); `false` keeps a file
+    /// that uses the spec's order byte-stable.
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+    pub real_first: bool,
+}
+
+#[cfg(feature = "serde")]
+fn default_true() -> bool {
+    true
+}
+
+/// Byte length of the mask parameter values announced by the parameter flags byte `pf`.
+pub(crate) fn mask_parameter_bytes(pf: u8) -> usize {
+    usize::from(pf & 1 != 0) + 8 * usize::from(pf & 2 != 0) + usize::from(pf & 4 != 0) + 8 * usize::from(pf & 8 != 0)
 }
 
 impl LayerMask {
@@ -190,11 +205,40 @@ impl LayerMask {
 
     /// The simple 20-byte form.
     pub fn new(rect: Rect, default_color: u8, flags: u8) -> Self {
-        LayerMask { rect, default_color, flags: flags & !Self::FLAG_PARAMETERS, parameters: None, real: None, trailing: vec![0, 0] }
+        LayerMask { rect, default_color, flags: flags & !Self::FLAG_PARAMETERS, parameters: None, real: None, trailing: vec![0, 0], real_first: true }
     }
     /// `true` if the disabled flag is set.
     pub fn disabled(&self) -> bool {
         self.flags & Self::FLAG_DISABLED != 0
+    }
+
+    /// Whether `d` (a whole mask record with mask parameters) stores the real-mask fields before
+    /// the parameters, as Photoshop does. The spec's order wins when it reads as parameters
+    /// followed by padding alone (no real mask), the one layout the two orders can share. When
+    /// both orders fit the record's length, Photoshop's is taken unless its reading is
+    /// implausible (a real-mask background that is neither 0 nor 255, or parameter flag bits
+    /// the spec does not define) while the spec's reading with a real mask is sound.
+    pub(crate) fn real_before_parameters(d: &[u8]) -> bool {
+        // Parameters at `pf_at`, then 0..=3 bytes of padding, and nothing else.
+        let fits =
+            |pf_at: usize| d.get(pf_at).is_some_and(|&pf| (pf_at + 1 + mask_parameter_bytes(pf)..=pf_at + 4 + mask_parameter_bytes(pf)).contains(&d.len()));
+        if fits(18) {
+            return false;
+        }
+        let photoshop = fits(36);
+        if !photoshop {
+            return false;
+        }
+        let known_flags = |pf: u8| pf & 0xF0 == 0;
+        let real_background_ok = |at: usize| d.get(at + 1).is_some_and(|&bg| bg == 0 || bg == 255);
+        // Photoshop's reading: real-mask fields at 18, parameters at 36.
+        let photoshop_plausible = real_background_ok(18) && d.get(36).is_some_and(|&pf| known_flags(pf));
+        // The spec's reading: parameters at 18, then the 18 real-mask bytes, then padding.
+        let spec_plausible = d.get(18).is_some_and(|&pf| {
+            let real_at = 19 + mask_parameter_bytes(pf);
+            known_flags(pf) && (real_at + 18..=real_at + 21).contains(&d.len()) && real_background_ok(real_at)
+        });
+        photoshop_plausible || !spec_plausible
     }
 
     fn parse(d: &[u8]) -> Result<Self> {
@@ -202,7 +246,13 @@ impl LayerMask {
         let rect = Rect::read(&mut r)?;
         let default_color = r.u8()?;
         let flags = r.u8()?;
-        let parameters = if flags & Self::FLAG_PARAMETERS != 0 {
+        let read_real = |r: &mut Reader<'_>| -> Result<Option<RealMask>> {
+            Ok(if r.remaining() >= 18 { Some(RealMask { flags: r.u8()?, background: r.u8()?, rect: Rect::read(r)? }) } else { None })
+        };
+        let has_parameters = flags & Self::FLAG_PARAMETERS != 0;
+        let real_first = has_parameters && Self::real_before_parameters(d);
+        let mut real = if real_first { read_real(&mut r)? } else { None };
+        let parameters = if has_parameters {
             let pf = r.u8()?;
             Some(MaskParameters {
                 flags: pf,
@@ -214,14 +264,28 @@ impl LayerMask {
         } else {
             None
         };
-        let real = if r.remaining() >= 18 { Some(RealMask { flags: r.u8()?, background: r.u8()?, rect: Rect::read(&mut r)? }) } else { None };
-        Ok(LayerMask { rect, default_color, flags, parameters, real, trailing: r.peek_rest().to_vec() })
+        if !real_first {
+            real = read_real(&mut r)?;
+        }
+        // The order only matters when both are present; otherwise default to Photoshop's.
+        let real_first = real_first || real.is_none() || parameters.is_none();
+        Ok(LayerMask { rect, default_color, flags, parameters, real, trailing: r.peek_rest().to_vec(), real_first })
     }
 
     fn write(&self, out: &mut Vec<u8>) {
         self.rect.write(out);
         out.put_u8(self.default_color);
         out.put_u8(self.flags);
+        let write_real = |out: &mut Vec<u8>| {
+            if let Some(real) = &self.real {
+                out.put_u8(real.flags);
+                out.put_u8(real.background);
+                real.rect.write(out);
+            }
+        };
+        if self.real_first {
+            write_real(out);
+        }
         if let Some(p) = &self.parameters {
             out.put_u8(p.flags);
             if let Some(v) = p.user_density {
@@ -237,10 +301,8 @@ impl LayerMask {
                 out.put_f64(v);
             }
         }
-        if let Some(real) = &self.real {
-            out.put_u8(real.flags);
-            out.put_u8(real.background);
-            real.rect.write(out);
+        if !self.real_first {
+            write_real(out);
         }
         out.put(&self.trailing);
     }
@@ -602,6 +664,32 @@ impl LayerInfo {
         Ok(LayerInfo { merged_alpha, layers, padding })
     }
 
+    /// Length of the body (layer count, records and channel data) without
+    /// its trailing padding.
+    pub fn unpadded_len(&self, version: Version) -> Result<u64> {
+        let mut records = Vec::new();
+        records.put_i16(0);
+        for l in &self.layers {
+            l.write(&mut records, version)?;
+        }
+        let mut n = records.len() as u64;
+        for c in self.layers.iter().flat_map(|l| &l.channels).filter(|c| c.compression.is_some()) {
+            n = n.saturating_add(2).saturating_add(c.data.len() as u64);
+        }
+        Ok(n)
+    }
+
+    /// Sets the padding so the body length is a multiple of `align`, as
+    /// Photoshop writes it (4). Readers that step over a global `Lr16`/`Lr32`
+    /// block in 4-byte units (psd-tools) misread the blocks after a body that
+    /// is only padded to even.
+    pub fn pad_to(&mut self, version: Version, align: u64) -> Result<()> {
+        let align = align.max(1);
+        let len = self.unpadded_len(version)?;
+        self.padding = Some(vec![0; ((align - len % align) % align) as usize]);
+        Ok(())
+    }
+
     /// Serializes the body (without a length field).
     pub(crate) fn write_body(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
         let start = out.len();
@@ -753,6 +841,96 @@ mod tests {
             m.write(&mut out);
             assert_eq!(LayerMask::parse(&out).unwrap(), m);
         }
+    }
+
+    /// Photoshop stores the real-mask fields before the mask parameters (psd-tools
+    /// mask-density-layervectormask.psd): user + vector mask with both densities set.
+    #[test]
+    fn real_mask_before_parameters_photoshop_layout() {
+        let mut d = Vec::new();
+        Rect::from_xywh(15, -1, 18, 10).write(&mut d);
+        d.extend([0, LayerMask::FLAG_PARAMETERS | 8]);
+        d.extend([0, 255]);
+        Rect::from_xywh(0, 0, 32, 8).write(&mut d);
+        d.extend([0b0101, 64, 64, 0]);
+        let m = LayerMask::parse(&d).unwrap();
+        assert_eq!(m.real.map(|r| r.rect), Some(Rect::from_xywh(0, 0, 32, 8)));
+        assert_eq!(m.real.map(|r| r.background), Some(255));
+        let p = m.parameters.unwrap();
+        assert_eq!((p.user_density, p.vector_density), (Some(64), Some(64)));
+        assert_eq!(m.trailing, vec![0]);
+        assert!(m.real_first);
+        let mut out = Vec::new();
+        m.write(&mut out);
+        assert_eq!(out, d);
+    }
+
+    /// A density-only record in the spec's order (#949): the parameter flags byte at 18 says one
+    /// value byte, so the spec's reading excludes the 38-byte length only if the real mask is
+    /// ignored, while byte 36 (inside the real rectangle's `right`) is 0 and makes Photoshop's
+    /// reading fit too. Photoshop's reading puts the density (64) where a 0-or-255 background
+    /// belongs, so the spec's order wins and the density survives.
+    #[test]
+    fn density_only_spec_layout_is_not_read_as_photoshop_order() {
+        for (density, right) in [(64u8, 1u32), (200, 1), (64, 300), (1, 7)] {
+            let mut d = Vec::new();
+            Rect::from_xywh(0, 0, 1, 1).write(&mut d);
+            d.extend([255, LayerMask::FLAG_PARAMETERS]);
+            d.extend([0b0001, density]);
+            d.extend([0, 0]);
+            Rect::from_xywh(0, 0, right, 1).write(&mut d);
+            let m = LayerMask::parse(&d).unwrap();
+            assert!(!m.real_first, "density {density}, right {right}: {m:?}");
+            assert_eq!(m.parameters.unwrap().user_density, Some(density));
+            assert_eq!(m.real, Some(RealMask { flags: 0, background: 0, rect: Rect::from_xywh(0, 0, right, 1) }));
+            assert!(m.trailing.is_empty());
+            let mut out = Vec::new();
+            m.write(&mut out);
+            assert_eq!(out, d);
+        }
+        // Photoshop's order with the same lengths still reads as Photoshop's order.
+        let mut d = Vec::new();
+        Rect::from_xywh(0, 0, 1, 1).write(&mut d);
+        d.extend([255, LayerMask::FLAG_PARAMETERS]);
+        d.extend([0, 255]);
+        Rect::from_xywh(0, 0, 1, 1).write(&mut d);
+        d.extend([0b0001, 64]);
+        let m = LayerMask::parse(&d).unwrap();
+        assert!(m.real_first, "{m:?}");
+        assert_eq!(m.parameters.unwrap().user_density, Some(64));
+        assert_eq!(m.real.map(|r| r.background), Some(255));
+        let mut out = Vec::new();
+        m.write(&mut out);
+        assert_eq!(out, d);
+    }
+
+    /// The spec's order (parameters, then real fields) still parses and stays byte-stable.
+    #[test]
+    fn real_mask_after_parameters_spec_layout() {
+        let mut d = Vec::new();
+        Rect::from_xywh(1, 2, 3, 4).write(&mut d);
+        d.extend([255, LayerMask::FLAG_PARAMETERS]);
+        d.extend([0b0011, 200]);
+        d.extend(1.5f64.to_be_bytes());
+        d.extend([0, 255]);
+        Rect::from_xywh(0, 0, 3, 3).write(&mut d);
+        let m = LayerMask::parse(&d).unwrap();
+        assert!(!m.real_first);
+        assert_eq!(m.real.map(|r| r.rect), Some(Rect::from_xywh(0, 0, 3, 3)));
+        assert_eq!(m.parameters.unwrap().user_feather, Some(1.5));
+        let mut out = Vec::new();
+        m.write(&mut out);
+        assert_eq!(out, d);
+        // Parameters alone (no real mask) keep reading in the spec's order.
+        let mut d = Vec::new();
+        Rect::from_xywh(1, 2, 3, 4).write(&mut d);
+        d.extend([255, LayerMask::FLAG_PARAMETERS, 0b1010]);
+        d.extend(1.0f64.to_be_bytes());
+        d.extend(2.0f64.to_be_bytes());
+        d.extend([0, 0]);
+        let m = LayerMask::parse(&d).unwrap();
+        assert_eq!(m.real, None);
+        assert_eq!(m.parameters.map(|p| (p.user_feather, p.vector_feather)), Some((Some(1.0), Some(2.0))));
     }
 
     #[test]

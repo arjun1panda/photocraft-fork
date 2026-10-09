@@ -82,8 +82,9 @@ pub fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
         "image.analysis.countTool" => Some(app.ui.tool == Tool::Count),
         _ => {
             // View › Proof Setup simulations: checked while that proof is shown.
+            // A check item with no document too: an item's kind never changes (native menus).
             let kind = id.strip_prefix("view.proofSetup.").and_then(photocraft_engine::proof_sim::ProofKind::from_id)?;
-            let d = app.session.active()?;
+            let Some(d) = app.session.active() else { return Some(false) };
             let pv = app.session.color.proof(d.doc.id);
             Some(pv.enabled && pv.setup.kind == kind)
         }
@@ -158,15 +159,18 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
             }
             r
         }
-        "file.import.notes" => {
-            let (name, bytes) = app.services.pick_open.as_mut().and_then(|f| f())?;
-            let r = photocraft_engine::notes_cmds::import_notes_from(&mut app.session, &name, &bytes).map_err(|e| e.to_string());
-            if r.is_ok() {
-                app.ui.analysis.notes = true;
-                app.sync_views();
-            }
-            r
-        }
+        "file.import.notes" => match app.active_doc_id() {
+            Ok(doc) => app.pick_file_bytes(move |app, name, bytes| {
+                app.refocus(doc)?;
+                let r = photocraft_engine::notes_cmds::import_notes_from(&mut app.session, &name, &bytes).map_err(|e| e.to_string());
+                if r.is_ok() {
+                    app.ui.analysis.notes = true;
+                    app.sync_views();
+                }
+                r
+            }),
+            Err(e) => Err(e),
+        },
         "measurementLog.export" => export_log(app, None),
         _ => return None,
     })
@@ -189,10 +193,11 @@ fn export_log(app: &mut PhotocraftApp, rows: Option<Vec<u64>>) -> Result<Value, 
     let p = rows.map_or(json!({}), |r| json!({"rows": r}));
     let csv = app.run("measurementLog.export", p)?;
     let text = csv["csv"].as_str().unwrap_or_default().to_string();
-    let path = app.services.pick_save.as_mut().and_then(|f| f("Measurements.csv")).ok_or("cancelled")?;
-    let write = app.services.write.as_mut().ok_or("no writer configured")?;
-    write(&path, text.as_bytes())?;
-    Ok(json!({"path": path, "rows": csv["rows"]}))
+    app.pick_save("Measurements.csv", move |app, path| {
+        let write = app.services.write.as_mut().ok_or("no writer configured")?;
+        write(&path, text.as_bytes())?;
+        Ok(json!({"path": path, "rows": csv["rows"]}))
+    })
 }
 
 // ------------------------------------------------------------------ tools
@@ -403,7 +408,7 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
 
 fn readout(ui: &mut egui::Ui, label: &str, value: Option<f64>) {
     let t = Tokens::get(ui.ctx());
-    ui.label(RichText::new(label).color(t.text_dim).size(11.0));
+    ui.label(RichText::new(tl!(&label)).color(t.text_dim).size(11.0));
     ui.label(RichText::new(value.map_or(String::new(), |v| format!("{v:.2}"))).color(t.text).size(11.0).monospace());
     ui.add_space(6.0);
 }
@@ -425,12 +430,12 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             readout(ui, "L1:", g("l1").map(|v| v * f));
             readout(ui, "L2:", g("l2").map(|v| v * f));
             crate::widgets::vline(ui, 22.0);
-            crate::widgets::checkbox(ui, &mut app.ui.analysis.use_measurement_scale, "Use Measurement Scale");
+            crate::widgets::checkbox(ui, &mut app.ui.analysis.use_measurement_scale, tl!("Use Measurement Scale"));
             let has = doc.measurement.ruler.is_some();
-            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, "Straighten Layer", 0.0)).inner.clicked() {
+            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, tl!("Straighten Layer"), 0.0)).inner.clicked() {
                 let _ = app.run("image.analysis.straightenLayer", json!({}));
             }
-            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, "Clear", 0.0)).inner.clicked() {
+            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, tl!("Clear"), 0.0)).inner.clicked() {
                 let _ = app.run("image.analysis.rulerTool", json!({"clear": true}));
             }
             true
@@ -438,7 +443,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
         Tool::Count => {
             let t = Tokens::get(ui.ctx());
             let m = &doc.measurement;
-            ui.label(RichText::new(format!("Count: {}", m.count_total())).color(t.text).size(11.0));
+            ui.label(RichText::new(crate::i18n::fmt(tl!("Count: {n}"), &[("n", &m.count_total().to_string())])).color(t.text).size(11.0));
             crate::widgets::vline(ui, 22.0);
             if !m.count_groups.is_empty() {
                 let mut gi = m.active_count_group.min(m.count_groups.len() - 1);
@@ -448,29 +453,29 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
                 }
                 let g = &m.count_groups[gi];
                 let eye = if g.visible { "eye" } else { "eye-off" };
-                if crate::icons::button(ui, eye, 22.0, false, "Toggle count group visibility").clicked() {
+                if crate::icons::button(ui, eye, 22.0, false, tl!("Toggle count group visibility")).clicked() {
                     let _ = app.run("count.setGroup", json!({"group": gi, "visible": !g.visible}));
                 }
                 let mut rgb = g.color.to_rgb();
-                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                if crate::widgets::color_edit_button_rgb(ui, &mut rgb).changed() {
                     let _ = app.run("count.setGroup", json!({"group": gi, "color": [rgb[0], rgb[1], rgb[2]], "coalesce": "count-color"}));
                 }
-                if crate::icons::button(ui, "trash", 22.0, false, "Delete count group").clicked() {
+                if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete count group")).clicked() {
                     let _ = app.run("count.deleteGroup", json!({"group": gi}));
                 }
             }
-            if crate::icons::button(ui, "folder-plus", 22.0, false, "Create a new count group").clicked() {
+            if crate::icons::button(ui, "folder-plus", 22.0, false, tl!("Create a new count group")).clicked() {
                 let _ = app.run("count.newGroup", json!({}));
             }
-            if crate::widgets::secondary_button(ui, "Clear", 0.0).clicked() && m.count_total() > 0 {
+            if crate::widgets::secondary_button(ui, tl!("Clear"), 0.0).clicked() && m.count_total() > 0 {
                 let _ = app.run("count.clear", json!({}));
             }
             if let Some(g) = m.count_groups.get(m.active_count_group) {
                 crate::widgets::vline(ui, 22.0);
                 let (mut ms, mut ls) = (g.marker_size as f32, g.label_size as f32);
-                ui.label(RichText::new("Marker Size").color(t.text_dim).size(11.0));
+                ui.label(RichText::new(tl!("Marker Size")).color(t.text_dim).size(11.0));
                 let a = crate::widgets::value_field(ui, &mut ms, 1.0..=10.0, "", 40.0).changed();
-                ui.label(RichText::new("Label Size").color(t.text_dim).size(11.0));
+                ui.label(RichText::new(tl!("Label Size")).color(t.text_dim).size(11.0));
                 let b = crate::widgets::value_field(ui, &mut ls, 8.0..=72.0, "", 44.0).changed();
                 if a || b {
                     let _ = app.run("count.setGroup", json!({"markerSize": ms.round(), "labelSize": ls.round()}));
@@ -480,15 +485,15 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
         }
         Tool::Note => {
             let t = Tokens::get(ui.ctx());
-            ui.label(RichText::new("Author:").color(t.text_dim).size(11.0));
+            ui.label(RichText::new(tl!("Author:")).color(t.text_dim).size(11.0));
             ui.add(egui::TextEdit::singleline(&mut app.ui.analysis.note_author).desired_width(120.0));
-            ui.label(RichText::new("Color:").color(t.text_dim).size(11.0));
-            ui.color_edit_button_rgb(&mut app.ui.analysis.note_color);
-            if ui.add_enabled_ui(!doc.notes.is_empty(), |ui| crate::widgets::secondary_button(ui, "Clear All", 0.0)).inner.clicked() {
+            ui.label(RichText::new(tl!("Color:")).color(t.text_dim).size(11.0));
+            crate::widgets::color_edit_button_rgb(ui, &mut app.ui.analysis.note_color);
+            if ui.add_enabled_ui(!doc.notes.is_empty(), |ui| crate::widgets::secondary_button(ui, tl!("Clear All"), 0.0)).inner.clicked() {
                 let _ = app.run("notes.delete", json!({"all": true}));
                 app.ui.analysis.note_selected = None;
             }
-            if crate::icons::button(ui, "message-square", 22.0, app.ui.analysis.notes, "Show or hide the Notes panel").clicked() {
+            if crate::icons::button(ui, "message-square", 22.0, app.ui.analysis.notes, tl!("Show or hide the Notes panel")).clicked() {
                 app.ui.analysis.notes = !app.ui.analysis.notes;
             }
             true
@@ -513,9 +518,9 @@ pub(crate) fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
     let t = Tokens::get(ui.ctx());
     let mut close = false;
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).color(t.text).size(12.0).strong());
+        ui.label(RichText::new(tl!(&title)).color(t.text).size(12.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if crate::icons::button(ui, "x", 20.0, false, "Close").clicked() {
+            if crate::icons::button(ui, "x", 20.0, false, tl!("Close")).clicked() {
                 close = true;
             }
         });
@@ -553,23 +558,23 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let rows = app.session.analysis.log.clone();
         let mut sel = app.ui.analysis.log_selected.clone();
         let t = Tokens::get(ctx);
-        panel_window(app, ctx, "measurement-log", "Measurement Log", vec2(-300.0, 470.0), 620.0, |ui| {
-            close = title_row(ui, "Measurement Log");
+        panel_window(app, ctx, "measurement-log", tl!("Measurement Log"), vec2(-300.0, 470.0), 620.0, |ui| {
+            close = title_row(ui, tl!("Measurement Log"));
             ui.horizontal(|ui| {
-                if crate::widgets::secondary_button(ui, "Record Measurements", 0.0).clicked() {
+                if crate::widgets::secondary_button(ui, tl!("Record Measurements"), 0.0).clicked() {
                     act = Some(("record", Value::Null));
                 }
-                if crate::widgets::secondary_button(ui, "Select All", 0.0).clicked() {
+                if crate::widgets::secondary_button(ui, tl!("Select All"), 0.0).clicked() {
                     sel = rows.iter().map(|r| r.id).collect();
                 }
-                if crate::widgets::secondary_button(ui, "Deselect All", 0.0).clicked() {
+                if crate::widgets::secondary_button(ui, tl!("Deselect All"), 0.0).clicked() {
                     sel.clear();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::icons::button(ui, "trash", 22.0, false, "Delete selected measurements").clicked() && !sel.is_empty() {
+                    if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete selected measurements")).clicked() && !sel.is_empty() {
                         act = Some(("measurementLog.delete", json!({"rows": sel.clone()})));
                     }
-                    if crate::icons::button(ui, "file", 22.0, false, "Export selected measurements (CSV)").clicked() {
+                    if crate::icons::button(ui, "file", 22.0, false, tl!("Export selected measurements (CSV)")).clicked() {
                         act = Some(("export", json!(sel.clone())));
                     }
                 });
@@ -579,7 +584,7 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 egui::Grid::new("mlog-grid").striped(true).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
                     for c in &cols {
                         let name = photocraft_engine::analysis_cmds::COLUMNS.iter().find(|x| x.0 == *c).map_or(*c, |x| x.1);
-                        ui.label(RichText::new(name).color(t.text_dim).size(10.5).strong());
+                        ui.label(RichText::new(tl!(name)).color(t.text_dim).size(10.5).strong());
                     }
                     ui.end_row();
                     for r in &rows {
@@ -645,15 +650,15 @@ fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let mut edit: Option<Value> = None;
     let mut delete = false;
     let t = Tokens::get(ctx);
-    panel_window(app, ctx, "notes-panel", "Notes", vec2(-40.0, 300.0), 260.0, |ui| {
-        close = title_row(ui, "Notes");
+    panel_window(app, ctx, "notes-panel", tl!("Notes"), vec2(-40.0, 300.0), 260.0, |ui| {
+        close = title_row(ui, tl!("Notes"));
         match sel {
             None => {
-                ui.label(RichText::new("Click with the Note tool to add a note.").color(t.text_dim).size(11.0));
+                ui.label(RichText::new(tl!("Click with the Note tool to add a note.")).color(t.text_dim).size(11.0));
             }
             Some(i) => {
                 let note = &notes[i];
-                ui.label(RichText::new(if note.author.is_empty() { "No author".to_string() } else { note.author.clone() }).color(t.text_dim).size(11.0));
+                ui.label(RichText::new(if note.author.is_empty() { tl!("No author").to_string() } else { note.author.clone() }).color(t.text_dim).size(11.0));
                 let mut text = note.text.clone();
                 if ui.add(egui::TextEdit::multiline(&mut text).desired_rows(6).desired_width(f32::INFINITY)).changed() {
                     edit = Some(json!({"index": i, "text": text, "coalesce": format!("note-{i}")}));
@@ -662,15 +667,15 @@ fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         crate::widgets::hairline(ui);
         ui.horizontal(|ui| {
-            if ui.add_enabled_ui(n > 1, |ui| crate::icons::button(ui, "chevrons-left", 22.0, false, "Previous note")).inner.clicked() {
+            if ui.add_enabled_ui(n > 1, |ui| crate::icons::button(ui, "chevrons-left", 22.0, false, tl!("Previous note"))).inner.clicked() {
                 sel = sel.map(|i| (i + n - 1) % n);
             }
-            if ui.add_enabled_ui(n > 1, |ui| crate::icons::button(ui, "chevrons-right", 22.0, false, "Next note")).inner.clicked() {
+            if ui.add_enabled_ui(n > 1, |ui| crate::icons::button(ui, "chevrons-right", 22.0, false, tl!("Next note"))).inner.clicked() {
                 sel = sel.map(|i| (i + 1) % n);
             }
             ui.label(RichText::new(sel.map_or("0 of 0".into(), |i| format!("{} of {n}", i + 1))).color(t.text_dim).size(11.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled_ui(sel.is_some(), |ui| crate::icons::button(ui, "trash", 22.0, false, "Delete note")).inner.clicked() {
+                if ui.add_enabled_ui(sel.is_some(), |ui| crate::icons::button(ui, "trash", 22.0, false, tl!("Delete note"))).inner.clicked() {
                     delete = true;
                 }
             });
@@ -694,7 +699,7 @@ fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
 fn num_field(ui: &mut egui::Ui, f: &mut Map<String, Value>, key: &str, label: &str, range: std::ops::RangeInclusive<f32>, suffix: &str) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(110.0, 18.0), egui::Label::new(RichText::new(label).color(t.text_dim).size(11.0)));
+        ui.add_sized(vec2(110.0, 18.0), egui::Label::new(RichText::new(tl!(&label)).color(t.text_dim).size(11.0)));
         let mut v = f.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
         if crate::widgets::value_field(ui, &mut v, range, suffix, 80.0).changed() {
             f.insert(key.into(), json!(v));
@@ -705,7 +710,7 @@ fn num_field(ui: &mut egui::Ui, f: &mut Map<String, Value>, key: &str, label: &s
 fn choice(ui: &mut egui::Ui, f: &mut Map<String, Value>, key: &str, label: &str, opts: &[(&str, &str)]) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(110.0, 18.0), egui::Label::new(RichText::new(label).color(t.text_dim).size(11.0)));
+        ui.add_sized(vec2(110.0, 18.0), egui::Label::new(RichText::new(tl!(&label)).color(t.text_dim).size(11.0)));
         let mut cur = f.get(key).and_then(Value::as_str).unwrap_or(opts[0].0).to_string();
         let list: Vec<(String, &str)> = opts.iter().map(|(k, l)| (k.to_string(), *l)).collect();
         if crate::widgets::dropdown(ui, &format!("an-{key}"), &mut cur, &list, 120.0) {
@@ -752,18 +757,18 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .frame(float_frame(&t))
         .show(ctx, |ui| {
-            ui.label(RichText::new(title).color(t.text).size(13.0).strong());
+            ui.label(RichText::new(tl!(&title)).color(t.text).size(13.0).strong());
             crate::widgets::hairline(ui);
             ui.add_space(6.0);
             match kind.as_str() {
                 "scale" => {
-                    choice(ui, &mut f, "preset", "Presets:", &[("custom", "Custom"), ("default", "Default")]);
+                    choice(ui, &mut f, "preset", tl!("Presets:"), &[("custom", tl!("Custom")), ("default", tl!("Default"))]);
                     let custom = f.get("preset").and_then(Value::as_str) != Some("default");
                     ui.add_enabled_ui(custom, |ui| {
-                        num_field(ui, &mut f, "pixelLength", "Pixel Length:", 0.001..=1e7, "");
-                        num_field(ui, &mut f, "logicalLength", "Logical Length:", 0.0001..=1e7, "");
+                        num_field(ui, &mut f, "pixelLength", tl!("Pixel Length:"), 0.001..=1e7, "");
+                        num_field(ui, &mut f, "logicalLength", tl!("Logical Length:"), 0.0001..=1e7, "");
                         ui.horizontal(|ui| {
-                            ui.add_sized(vec2(110.0, 18.0), egui::Label::new(RichText::new("Logical Units:").color(t.text_dim).size(11.0)));
+                            ui.add_sized(vec2(110.0, 18.0), egui::Label::new(RichText::new(tl!("Logical Units:")).color(t.text_dim).size(11.0)));
                             let mut u = f.get("units").and_then(Value::as_str).unwrap_or("pixels").to_string();
                             if ui.add(egui::TextEdit::singleline(&mut u).desired_width(80.0)).changed() {
                                 f.insert("units".into(), json!(u));
@@ -773,13 +778,13 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     let (pl, ll) = (f.get("pixelLength").and_then(Value::as_f64).unwrap_or(1.0), f.get("logicalLength").and_then(Value::as_f64).unwrap_or(1.0));
                     let u = f.get("units").and_then(Value::as_str).unwrap_or("pixels");
                     let text = if custom { format!("{pl} pixels = {ll:.4} {u}") } else { "1 pixels = 1.0000 pixels".into() };
-                    ui.label(RichText::new(text).color(t.text_dim).size(11.0));
+                    ui.label(RichText::new(tl!(&text)).color(t.text_dim).size(11.0));
                 }
                 "dataPoints" => {
                     ui.horizontal_top(|ui| {
-                        for (source, label) in [("selection", "Selections"), ("ruler", "Ruler Tool"), ("count", "Count Tool")] {
+                        for (source, label) in [("selection", tl!("Selections")), ("ruler", tl!("Ruler Tool")), ("count", tl!("Count Tool"))] {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(label).color(t.text).size(11.0).strong());
+                                ui.label(RichText::new(tl!(&label)).color(t.text).size(11.0).strong());
                                 let mut list: Vec<String> = f
                                     .get(source)
                                     .and_then(Value::as_array)
@@ -807,24 +812,27 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 }
                 _ => {
                     let units = f.get("units").and_then(Value::as_str).unwrap_or("pixels").to_string();
-                    num_field(ui, &mut f, "length", "Length:", 0.0001..=1e7, &units);
-                    num_field(ui, &mut f, "fontSize", "Font Size:", 1.0..=1000.0, "pt");
+                    num_field(ui, &mut f, "length", tl!("Length:"), 0.0001..=1e7, &units);
+                    num_field(ui, &mut f, "fontSize", tl!("Font Size:"), 1.0..=1000.0, "pt");
                     let mut show = f.get("displayText").and_then(Value::as_bool).unwrap_or(true);
-                    if crate::widgets::checkbox(ui, &mut show, "Display Text").changed() {
+                    if crate::widgets::checkbox(ui, &mut show, tl!("Display Text")).changed() {
                         f.insert("displayText".into(), json!(show));
                     }
-                    choice(ui, &mut f, "textPosition", "Text Position:", &[("bottom", "Bottom"), ("top", "Top")]);
-                    choice(ui, &mut f, "color", "Color:", &[("black", "Black"), ("white", "White")]);
+                    choice(ui, &mut f, "textPosition", tl!("Text Position:"), &[("bottom", tl!("Bottom")), ("top", tl!("Top"))]);
+                    choice(ui, &mut f, "color", tl!("Color:"), &[("black", tl!("Black")), ("white", tl!("White"))]);
                 }
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::widgets::primary_button(ui, "OK", 70.0).clicked() {
-                        result = Some(true);
-                    }
-                    if crate::widgets::secondary_button(ui, "Cancel", 70.0).clicked() {
-                        result = Some(false);
+                    if let Some(role) = crate::widgets::dialog_buttons(
+                        ui,
+                        &[
+                            crate::widgets::DialogButton::new(crate::widgets::ButtonRole::Default, tl!("OK"), 70.0),
+                            crate::widgets::DialogButton::new(crate::widgets::ButtonRole::Cancel, tl!("Cancel"), 70.0),
+                        ],
+                    ) {
+                        result = Some(role == crate::widgets::ButtonRole::Default);
                     }
                 });
             });
@@ -896,6 +904,23 @@ pub(crate) mod tests {
             "view.proofSetup.workingCyanPlate",
         ] {
             assert!(items.iter().any(|i| i.id == id && i.enabled), "{id} live");
+        }
+    }
+
+    #[test]
+    fn arbitrary_rotation_starts_at_the_ruler_angle() {
+        let (mut app, ctx) = app();
+        let open = |app: &mut PhotocraftApp| {
+            let r = crate::menus::invoke(app, &ctx, "image.rotation.arbitrary", json!({})).unwrap();
+            let f = &app.ui.dialog_mut(r["dialog"].as_u64().unwrap()).unwrap().fields;
+            (f["angle"].as_f64().unwrap(), f["direction"].clone())
+        };
+        assert_eq!(open(&mut app), (0.0, json!("cw")));
+        // A line falling to the right straightens counter-clockwise, a near-vertical one to the y axis.
+        for (end, dir) in [([150, 60], "ccw"), ([150, 40], "cw"), ([60, -50], "ccw")] {
+            app.run("image.analysis.rulerTool", json!({"start": [50, 50], "end": end})).unwrap();
+            let (a, d) = open(&mut app);
+            assert!((a - 5.7106).abs() < 1e-3 && d == json!(dir), "{end:?}: {a} {d}");
         }
     }
 

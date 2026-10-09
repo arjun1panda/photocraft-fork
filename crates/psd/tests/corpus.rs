@@ -1,6 +1,7 @@
-//! Optional corpus test: iterates `corpus/psd/**/*.{psd,psb}` at the
-//! workspace root when present (fetched by `xtask corpus`; never committed).
-//! Skips silently when the directory does not exist.
+//! Corpus test (feature `corpus`; run with `cargo xtask test-corpus`): iterates
+//! `corpus/psd/**/*.{psd,psb}` and `corpus/psd-tools/**/*.{psd,psb}` at the workspace root
+//! (gitignored, fetched and verified by `cargo xtask corpus --all`). A missing corpus fails.
+#![cfg(feature = "corpus")]
 
 use std::path::{Path, PathBuf};
 
@@ -24,16 +25,19 @@ const KNOWN_BAD: &[(&str, &str)] = &[("group-divider-blend-mode.psd", "psd-tools
 
 #[test]
 fn corpus_parse_and_byte_stable() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/psd");
-    if !root.is_dir() {
-        return;
+    for dir in ["corpus/psd", "corpus/psd-tools"] {
+        parse_and_byte_stable(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(dir));
     }
+}
+
+fn parse_and_byte_stable(root: &Path) {
+    assert!(root.is_dir(), "{} is missing: run `cargo xtask corpus --all`", root.display());
     let mut files = Vec::new();
-    collect(&root, &mut files);
+    collect(root, &mut files);
     files.sort();
     let mut failures = Vec::new();
     for p in &files {
-        let name = p.strip_prefix(&root).unwrap_or(p).display().to_string();
+        let name = p.strip_prefix(root).unwrap_or(p).display().to_string();
         let bytes = match std::fs::read(p) {
             Ok(b) => b,
             Err(e) => {
@@ -61,6 +65,6 @@ fn corpus_parse_and_byte_stable() {
             },
         }
     }
-    eprintln!("corpus: {} files, {} failures", files.len(), failures.len());
+    eprintln!("corpus {}: {} files, {} failures", root.display(), files.len(), failures.len());
     assert!(failures.is_empty(), "corpus failures:\n{}", failures.join("\n"));
 }

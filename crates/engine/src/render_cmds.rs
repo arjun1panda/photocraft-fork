@@ -22,7 +22,7 @@ fn parse_colour(v: &Value) -> Option<[f32; 4]> {
             Some([c(0, 0.0), c(1, 0.0), c(2, 0.0), c(3, 1.0)])
         }
         Value::String(h) if h.len() == 7 && h.starts_with('#') => {
-            let ch = |j: usize| u8::from_str_radix(&h[j..j + 2], 16).map_or(0.0, |v| v as f32 / 255.0);
+            let ch = |j: usize| h.get(j..j + 2).and_then(|s| u8::from_str_radix(s, 16).ok()).map_or(0.0, |v| v as f32 / 255.0);
             Some([ch(1), ch(3), ch(5), 1.0])
         }
         _ => None,
@@ -104,8 +104,7 @@ fn draw(s: &mut Session, label: &str, p: &Value, prims: Vec<Prim>, extra: Value)
         if let Some(sel) = &selection {
             clip = clip.intersect(&sel.content_bounds());
         }
-        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        let LayerContent::Raster(surf) = &mut l.content else { return Err(EngineError::Other("not a pixel layer".into())) };
+        let surf = crate::commands::paint_surface(doc, id, &Value::Null)?;
         let used = render2::composite(surf, &prims, clip, selection.as_ref());
         surf.prune();
         Ok((id, created, used))

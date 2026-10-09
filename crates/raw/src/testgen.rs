@@ -178,6 +178,7 @@ pub enum Val {
     Ascii(String),
     Short(Vec<u16>),
     Long(Vec<u32>),
+    Double(Vec<f64>),
     Rational(Vec<(u32, u32)>),
     SRational(Vec<(i32, i32)>),
     Undefined(Vec<u8>),
@@ -219,6 +220,7 @@ impl TiffBuilder {
             Val::Ascii(s) => s.len() + 1,
             Val::Short(s) => 2 * s.len(),
             Val::Long(l) => 4 * l.len(),
+            Val::Double(d) => 8 * d.len(),
             Val::Rational(r) => 8 * r.len(),
             Val::SRational(r) => 8 * r.len(),
             Val::Blobs(b) => 4 * b.len(),
@@ -330,6 +332,7 @@ impl TiffBuilder {
         let be = self.big_endian;
         let b16 = |v: u16| if be { v.to_be_bytes() } else { v.to_le_bytes() };
         let b32 = |v: u32| if be { v.to_be_bytes() } else { v.to_le_bytes() };
+        let b64 = |v: u64| if be { v.to_be_bytes() } else { v.to_le_bytes() };
         match v {
             Val::Byte(b) => (1, b.len() as u32, b.clone()),
             Val::Undefined(b) => (7, b.len() as u32, b.clone()),
@@ -340,6 +343,7 @@ impl TiffBuilder {
             }
             Val::Short(s) => (3, s.len() as u32, s.iter().flat_map(|&v| b16(v)).collect()),
             Val::Long(l) => (4, l.len() as u32, l.iter().flat_map(|&v| b32(v)).collect()),
+            Val::Double(d) => (12, d.len() as u32, d.iter().flat_map(|v| b64(v.to_bits())).collect()),
             Val::Rational(r) => (5, r.len() as u32, r.iter().flat_map(|&(n, d)| [b32(n), b32(d)].concat()).collect()),
             Val::SRational(r) => (10, r.len() as u32, r.iter().flat_map(|&(n, d)| [b32(n as u32), b32(d as u32)].concat()).collect()),
             Val::Blobs(b) => (4, b.len() as u32, b.iter().flat_map(|&i| b32(blob_pos[i] as u32)).collect()),
@@ -390,6 +394,10 @@ pub struct DngSpec {
     pub active_area: Option<[u32; 4]>,
     /// origin (x, y), size (w, h), relative to the active area
     pub default_crop: Option<([u32; 2], [u32; 2])>,
+    /// Double-precision origin override for malformed-metadata regression tests.
+    pub default_crop_origin_double: Option<[f64; 2]>,
+    /// A DefaultCropSize with no DefaultCropOrigin (`default_crop` must be `None`).
+    pub default_crop_size_only: Option<[u32; 2]>,
     pub linearization: Option<Vec<u16>>,
     /// (illuminant code, ColorMatrix row-major)
     pub color_matrix1: Option<(u16, [f64; 9])>,
@@ -422,6 +430,8 @@ impl DngSpec {
             white: 65535,
             active_area: None,
             default_crop: None,
+            default_crop_origin_double: None,
+            default_crop_size_only: None,
             linearization: None,
             color_matrix1: None,
             color_matrix2: None,
@@ -552,8 +562,13 @@ impl DngSpec {
             raw.push((50829, Val::Long(a.to_vec())));
         }
         if let Some((o, s)) = self.default_crop {
-            raw.push((50719, Val::Long(o.to_vec())));
+            let origin = self.default_crop_origin_double.map(|d| Val::Double(d.to_vec())).unwrap_or_else(|| Val::Long(o.to_vec()));
+            raw.push((50719, origin));
             raw.push((50720, Val::Long(s.to_vec())));
+        } else if let Some(origin) = self.default_crop_origin_double {
+            raw.push((50719, Val::Double(origin.to_vec())));
+        } else if let Some(size) = self.default_crop_size_only {
+            raw.push((50720, Val::Long(size.to_vec())));
         }
         if let Some(o) = &self.opcode_list2 {
             raw.push((51009, Val::Undefined(o.clone())));
@@ -640,7 +655,7 @@ pub fn gain_map_opcode_list(area: [u32; 4], pitch: u32, gains: [[f32; 2]; 2]) ->
 pub struct Cr2Spec {
     pub width: usize,
     pub height: usize,
-    /// Sensor samples, row-major, RGGB from (`left`, `top`).
+    /// Sensor samples, row-major.
     pub data: Vec<u16>,
     pub precision: u8,
     pub components: usize,
@@ -651,6 +666,8 @@ pub struct Cr2Spec {
     /// As-shot RGGB levels written to ColorData at word offset 0x3F.
     pub wb_rggb: Option<[u16; 4]>,
     pub orientation: u16,
+    /// Canon model ID written to MakerNote tag 0x0010.
+    pub model_id: Option<u32>,
 }
 
 impl Cr2Spec {
@@ -679,6 +696,9 @@ impl Cr2Spec {
         }
         let raw_ifd = t.ifd(raw);
         let mut mn: Vec<(u16, Val)> = Vec::new();
+        if let Some(id) = self.model_id {
+            mn.push((0x0010, Val::Long(vec![id])));
+        }
         if let Some([l, tp, r, b]) = self.borders {
             mn.push((0x00E0, Val::Short(vec![34, w as u16, h as u16, 0, 0, l, tp, r, b, 0, 0, 0, 0, 0, 0, 0, 0])));
         }
@@ -753,6 +773,272 @@ pub fn tiff_ep(make: &str, width: usize, height: usize, data: &[u16], cfa: [u8; 
     ]);
     t.chain = vec![ifd0];
     t.build()
+}
+
+/// A synthetic Nikon NEF with a Huffman-compressed (34713) strip: IFD0 with
+/// Make and an EXIF IFD whose maker note (`Nikon\0`, version 2.10, then an
+/// embedded TIFF in the given byte order) holds `note_tags` (for example
+/// `0x0096`, the decode table, and `0x003d`, BlackLevel).
+pub fn nef_compressed(width: usize, height: usize, bits: u16, strip: Vec<u8>, cfa: [u8; 4], note_big_endian: bool, note_tags: Vec<(u16, Val)>) -> Vec<u8> {
+    let mut note = TiffBuilder { big_endian: note_big_endian, ..Default::default() };
+    let n = note.ifd(note_tags);
+    note.chain = vec![n];
+    let mut maker = b"Nikon\0\x02\x10\0\0".to_vec();
+    maker.extend(note.build());
+    let mut t = TiffBuilder::default();
+    let len = strip.len();
+    let strip = t.blob(strip);
+    let raw_ifd = t.ifd(vec![
+        (254, Val::Long(vec![0])),
+        (256, Val::Long(vec![width as u32])),
+        (257, Val::Long(vec![height as u32])),
+        (258, Val::Short(vec![bits])),
+        (259, Val::Short(vec![34713])),
+        (262, Val::Short(vec![32803])),
+        (273, Val::Blobs(vec![strip])),
+        (277, Val::Short(vec![1])),
+        (278, Val::Long(vec![height as u32])),
+        (279, Val::Long(vec![len as u32])),
+        (33421, Val::Short(vec![2, 2])),
+        (33422, Val::Byte(cfa.to_vec())),
+    ]);
+    let exif = t.ifd(vec![(37500, Val::Undefined(maker))]);
+    let ifd0 = t.ifd(vec![(271, Val::Ascii("NIKON CORPORATION".into())), (330, Val::Ifds(vec![raw_ifd])), (34665, Val::Ifds(vec![exif]))]);
+    t.chain = vec![ifd0];
+    t.build()
+}
+
+// ---------------------------------------------------------------- Sony cRAW
+
+/// Encodes 16 same-colour 11-bit codes as one cRAW block (see the decoder in
+/// `sony.rs`): maximum, minimum, their positions, then 7-bit deltas at the
+/// smallest power-of-two step that covers the range (rounded down).
+pub fn craw_block(codes: &[u16; 16]) -> [u8; 16] {
+    let max = *codes.iter().max().unwrap();
+    let min = *codes.iter().min().unwrap();
+    let imax = codes.iter().position(|&c| c == max).unwrap();
+    let mut imin = codes.iter().position(|&c| c == min).unwrap();
+    if imin == imax {
+        imin = (imax + 1) % 16;
+    }
+    let mut sh = 0;
+    while (128u16 << sh) <= max - min {
+        sh += 1;
+    }
+    let mut v: u128 = u128::from(max) | u128::from(min) << 11 | (imax as u128) << 22 | (imin as u128) << 26;
+    let mut at = 30;
+    for (i, &c) in codes.iter().enumerate() {
+        if i != imax && i != imin {
+            v |= u128::from(((c - min) >> sh).min(127)) << at;
+            at += 7;
+        }
+    }
+    v.to_le_bytes()
+}
+
+/// Encodes a mosaic of 11-bit codes (`width` a multiple of 32) as cRAW rows.
+pub fn craw_encode(codes: &[u16], width: usize, height: usize) -> Vec<u8> {
+    assert_eq!(width % 32, 0);
+    let mut out = Vec::with_capacity(width * height);
+    for row in codes.chunks_exact(width).take(height) {
+        for g in row.as_chunks::<32>().0 {
+            for parity in 0..2 {
+                let seq: [u16; 16] = std::array::from_fn(|i| g[2 * i + parity].min(2047));
+                out.extend_from_slice(&craw_block(&seq));
+            }
+        }
+    }
+    out
+}
+
+/// A synthetic Sony compressed ARW: IFD0 with Make, the cRAW image in a
+/// SubIFD with SonyRawFileType 2, the tone curve (0x7010), black (0x7310),
+/// white (50717) and WB_RGGBLevels (0x7313).
+pub fn sony_craw(width: usize, height: usize, codes: &[u16], curve: [u16; 4]) -> Vec<u8> {
+    let bytes = craw_encode(codes, width, height);
+    let mut t = TiffBuilder::default();
+    let n = bytes.len();
+    let strip = t.blob(bytes);
+    let raw_ifd = t.ifd(vec![
+        (254, Val::Long(vec![0])),
+        (256, Val::Long(vec![width as u32])),
+        (257, Val::Long(vec![height as u32])),
+        (258, Val::Short(vec![12])),
+        (259, Val::Short(vec![32767])),
+        (262, Val::Short(vec![32803])),
+        (273, Val::Blobs(vec![strip])),
+        (277, Val::Short(vec![1])),
+        (278, Val::Long(vec![height as u32])),
+        (279, Val::Long(vec![n as u32])),
+        (33421, Val::Short(vec![2, 2])),
+        (33422, Val::Byte(vec![0, 1, 1, 2])),
+        (0x7000, Val::Short(vec![2])),
+        (0x7010, Val::Short(curve.to_vec())),
+        (0x7310, Val::Short(vec![512; 4])),
+        (0x7313, Val::Short(vec![2048, 1024, 1024, 1536])),
+        (50717, Val::Short(vec![16383])),
+    ]);
+    let ifd0 = t.ifd(vec![(271, Val::Ascii("SONY".into())), (272, Val::Ascii("ILCE-Synthetic".into())), (330, Val::Ifds(vec![raw_ifd]))]);
+    t.chain = vec![ifd0];
+    t.build()
+}
+
+// ---------------------------------------------------------------- Panasonic RW2
+
+/// Page size and split point of the RW2 stream (see `rw2.rs`).
+const RW2_PAGE: usize = 0x4000;
+const RW2_SPLIT: usize = 0x1FF8;
+
+/// Packs `bits`-bit samples (12: 10 per block, 14: 9 per block) into the RW2
+/// RawFormat 5 layout: 16-byte little-endian blocks, stored in 0x4000-byte
+/// pages split at 0x1FF8.
+pub fn rw2_pack(data: &[u16], width: usize, bits: u32) -> Vec<u8> {
+    let ppb = if bits == 14 { 9 } else { 10 };
+    assert_eq!(width % ppb, 0);
+    let mut logical = Vec::new();
+    for px in data.chunks_exact(ppb) {
+        let mut v: u128 = 0;
+        for (i, &p) in px.iter().enumerate() {
+            v |= u128::from(p & ((1 << bits) - 1)) << (bits as usize * i);
+        }
+        logical.extend_from_slice(&v.to_le_bytes());
+    }
+    logical.resize(logical.len().div_ceil(RW2_PAGE) * RW2_PAGE, 0);
+    let mut out = vec![0u8; logical.len()];
+    for (i, &b) in logical.iter().enumerate() {
+        let page = i - i % RW2_PAGE;
+        out[page + (i % RW2_PAGE + RW2_SPLIT) % RW2_PAGE] = b;
+    }
+    out
+}
+
+/// A synthetic Panasonic RW2 (RawFormat 5) with an RGGB sensor, a 2-pixel
+/// border on every side, black levels 128 / 129 / 130 and WB levels
+/// 512 / 256 / 384.
+pub fn rw2(width: usize, height: usize, data: &[u16], bits: u32) -> Vec<u8> {
+    let mut t = TiffBuilder::default();
+    let raw = t.blob(rw2_pack(data, width, bits));
+    let white = ((1u32 << bits) - 1) as u16;
+    let ifd0 = t.ifd(vec![
+        (0x0002, Val::Short(vec![width as u16])),
+        (0x0003, Val::Short(vec![height as u16])),
+        (0x0004, Val::Short(vec![2])),
+        (0x0005, Val::Short(vec![2])),
+        (0x0006, Val::Short(vec![height as u16 - 2])),
+        (0x0007, Val::Short(vec![width as u16 - 2])),
+        (0x0009, Val::Short(vec![1])),
+        (0x000A, Val::Short(vec![bits as u16])),
+        (0x000E, Val::Short(vec![white])),
+        (0x000F, Val::Short(vec![white])),
+        (0x0010, Val::Short(vec![white])),
+        (0x001C, Val::Short(vec![128])),
+        (0x001D, Val::Short(vec![129])),
+        (0x001E, Val::Short(vec![130])),
+        (0x0024, Val::Short(vec![512])),
+        (0x0025, Val::Short(vec![256])),
+        (0x0026, Val::Short(vec![384])),
+        (0x002D, Val::Short(vec![5])),
+        (0x010F, Val::Ascii("Panasonic".into())),
+        (0x0110, Val::Ascii("DC-Synthetic".into())),
+        (0x0112, Val::Short(vec![1])),
+        (0x0118, Val::Blobs(vec![raw])),
+    ]);
+    t.chain = vec![ifd0];
+    let mut b = t.build();
+    b[2..4].copy_from_slice(b"U\0");
+    b
+}
+
+// ---------------------------------------------------------------- Olympus ORF
+
+/// A little-endian IFD whose value offsets are relative to `base` (the IFD
+/// itself sits at `base_offset` from that base). Entries: (tag, type, count,
+/// value bytes).
+fn relative_ifd(entries: &[(u16, u16, u32, Vec<u8>)], base_offset: usize) -> Vec<u8> {
+    let head = 2 + 12 * entries.len() + 4;
+    let mut out = Vec::new();
+    let mut extra = Vec::new();
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, typ, count, bytes) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&typ.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        if bytes.len() <= 4 {
+            let mut v = bytes.clone();
+            v.resize(4, 0);
+            out.extend_from_slice(&v);
+        } else {
+            out.extend_from_slice(&((base_offset + head + extra.len()) as u32).to_le_bytes());
+            extra.extend_from_slice(bytes);
+        }
+    }
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&extra);
+    out
+}
+
+fn shorts(v: &[u16]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// A synthetic uncompressed Olympus ORF (`IIRO`): 12-bit `data` stored
+/// left-justified in 16-bit samples, a GRBG EXIF CFAPattern and a new-style
+/// maker note with ImageProcessing levels (black 64, WB 2.0 / 1.5, crop of a
+/// 2-pixel border) and CameraSettings pointing at a tiny preview JPEG.
+pub fn orf(width: usize, height: usize, data: &[u16]) -> Vec<u8> {
+    let ip = relative_ifd(
+        &[
+            (0x0100, 3, 2, shorts(&[512, 384])),
+            (0x011F, 3, 1, shorts(&[256])),
+            (0x0600, 3, 4, shorts(&[64, 64, 64, 64])),
+            (0x0611, 3, 2, shorts(&[12, 0])),
+            (0x0612, 3, 2, shorts(&[2, 0])),
+            (0x0613, 3, 2, shorts(&[2, 0])),
+            (0x0614, 4, 1, ((width - 4) as u32).to_le_bytes().to_vec()),
+            (0x0615, 4, 1, ((height - 4) as u32).to_le_bytes().to_vec()),
+        ],
+        64,
+    );
+    // CameraSettings with a preview JPEG (SOI, SOF0 16×8, EOI) right after it.
+    let jpeg = [0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 8, 0x00, 0x08, 0x00, 0x10, 1, 1, 0x11, 0, 0xFF, 0xD9];
+    let cs_at = 64 + ip.len().next_multiple_of(4);
+    let cs_len = 2 + 12 * 3 + 4;
+    let cs = relative_ifd(
+        &[
+            (0x0100, 4, 1, 1u32.to_le_bytes().to_vec()),
+            (0x0101, 4, 1, ((cs_at + cs_len) as u32).to_le_bytes().to_vec()),
+            (0x0102, 4, 1, (jpeg.len() as u32).to_le_bytes().to_vec()),
+        ],
+        cs_at,
+    );
+    let mut note = b"OLYMPUS\0II\x03\0".to_vec();
+    note.extend_from_slice(&relative_ifd(&[(0x2020, 13, 1, (cs_at as u32).to_le_bytes().to_vec()), (0x2040, 13, 1, 64u32.to_le_bytes().to_vec())], 12));
+    note.resize(64, 0);
+    note.extend_from_slice(&ip);
+    note.resize(cs_at, 0);
+    note.extend_from_slice(&cs);
+    note.extend_from_slice(&jpeg);
+    let mut t = TiffBuilder::default();
+    let strip = t.blob(data.iter().flat_map(|v| (v << 4).to_le_bytes()).collect());
+    let exif = t.ifd(vec![(37500, Val::Undefined(note)), (41730, Val::Undefined(vec![2, 0, 2, 0, 1, 0, 2, 1]))]);
+    let ifd0 = t.ifd(vec![
+        (256, Val::Long(vec![width as u32])),
+        (257, Val::Long(vec![height as u32])),
+        (258, Val::Short(vec![16])),
+        (259, Val::Short(vec![1])),
+        (262, Val::Short(vec![1])),
+        (271, Val::Ascii("OLYMPUS IMAGING CORP.".into())),
+        (272, Val::Ascii("E-Synthetic".into())),
+        (273, Val::Blobs(vec![strip])),
+        (277, Val::Short(vec![1])),
+        (278, Val::Long(vec![height as u32])),
+        (279, Val::Long(vec![(data.len() * 2) as u32])),
+        (34665, Val::Ifds(vec![exif])),
+    ]);
+    t.chain = vec![ifd0];
+    let mut b = t.build();
+    b[2..4].copy_from_slice(b"RO");
+    b
 }
 
 // ---------------------------------------------------------------- scenes

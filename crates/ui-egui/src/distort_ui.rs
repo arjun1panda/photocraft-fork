@@ -51,7 +51,7 @@ pub(crate) fn active_pixels(app: &PhotocraftApp) -> Result<(LayerId, Surface, bo
     match &l.content {
         LayerContent::Raster(s) => Ok((id, s.clone(), false)),
         LayerContent::Smart(sm) => sm.cache.clone().map(|c| (id, c, true)).ok_or_else(|| "the smart object has no pixels".to_string()),
-        other => Err(format!("needs a pixel layer or smart object (active layer is a {} layer)", other.kind_name())),
+        other => Err(format!("needs a pixel layer or smart object (active layer is {} {} layer)", other.article(), other.kind_name())),
     }
 }
 
@@ -157,7 +157,7 @@ pub fn keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
         if enter(ctx) {
             crate::liquify_ui::commit(app);
         } else if esc(ctx) {
-            app.distort.liquify = None;
+            crate::liquify_ui::cancel(app);
         } else {
             crate::liquify_ui::keys(app, ctx);
         }

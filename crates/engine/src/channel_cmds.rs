@@ -52,6 +52,8 @@ pub struct ChannelView {
     /// Visible alpha channels (missing entries are hidden).
     pub alpha_visible: Vec<bool>,
     pub quick_mask_hidden: bool,
+    /// ⌥-click view of the active layer's mask (#196); see [`crate::mask_view_cmds`].
+    pub layer_mask: Option<crate::mask_view_cmds::LayerMaskView>,
 }
 
 impl ChannelView {
@@ -80,7 +82,15 @@ impl ChannelView {
     /// True when the canvas shows just the normal composite (nothing extra to draw).
     pub fn is_plain(&self, doc: &Document) -> bool {
         let colors = color_count(doc);
-        self.visible_colors(colors) == colors && !(0..doc.channels.len()).any(|i| self.alpha_shown(i)) && (doc.quick_mask.is_none() || self.quick_mask_hidden)
+        self.visible_colors(colors) == colors
+            && !(0..doc.channels.len()).any(|i| self.alpha_shown(i))
+            && (doc.quick_mask.is_none() || self.quick_mask_hidden)
+            && self.shown_layer_mask(doc).is_none()
+    }
+    /// The layer mask shown on the canvas (#196) and how, if its layer still has a mask.
+    pub fn shown_layer_mask<'a>(&self, doc: &'a Document) -> Option<(&'a photocraft_doc::LayerMask, crate::mask_view_cmds::MaskViewMode)> {
+        let v = self.layer_mask?;
+        Some((doc.layer(v.layer)?.mask.as_ref()?, v.mode))
     }
 }
 
@@ -115,6 +125,7 @@ pub(crate) fn fix_view(st: &mut DocState) {
     if v.visible_colors(colors) == 0 && !(0..n).any(|i| v.alpha_shown(i)) {
         v.color_hidden.clear();
     }
+    crate::mask_view_cmds::fix(st);
 }
 
 /// Bump the revision for a view-only change without dirtying a clean document.
@@ -212,6 +223,8 @@ pub enum ChanRef {
     Selection,
     Transparency,
     LayerMask,
+    /// The layer's vector mask, rasterized (⌘-click its thumbnail, #196).
+    VectorMask,
 }
 
 pub fn parse_ref(v: &Value, doc: &Document) -> Option<ChanRef> {
@@ -233,6 +246,7 @@ pub fn parse_ref(v: &Value, doc: &Document) -> Option<ChanRef> {
                 "selection" => return Some(ChanRef::Selection),
                 "transparency" => return Some(ChanRef::Transparency),
                 "mask" | "layermask" => return Some(ChanRef::LayerMask),
+                "vectormask" | "vector mask" => return Some(ChanRef::VectorMask),
                 _ => {}
             }
             if l == composite_name(mode).to_ascii_lowercase() {
@@ -334,6 +348,14 @@ fn ref_planes(doc: &Document, layer: Option<LayerId>, active: Option<LayerId>, r
             let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
             let m = l.mask.as_ref().ok_or_else(|| EngineError::Other(format!("layer \"{}\" has no mask", l.name)))?;
             vec![read_plane(&m.surface, area)]
+        }
+        ChanRef::VectorMask => {
+            let id = layer.or(active).ok_or_else(|| EngineError::Other("vector mask needs a layer".into()))?;
+            let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+            let m = l.vector_mask.as_ref().ok_or_else(|| EngineError::Other(format!("layer \"{}\" has no vector mask", l.name)))?;
+            // The path's shape, whether or not the mask is enabled (as Photoshop loads it).
+            let shape = photocraft_doc::VectorMask { enabled: true, density: 1.0, feather: 0.0, ..m.clone() };
+            vec![photocraft_vector::vector_mask_values(&shape, area)]
         }
     })
 }
@@ -492,23 +514,46 @@ pub(crate) fn target_surface<'a>(doc: &'a mut Document, layer: Option<LayerId>, 
         Target::QuickMask => doc.quick_mask.as_mut().map(|c| (&mut c.surface, false)).ok_or_else(|| EngineError::Other("not in Quick Mask mode".into())),
         t => {
             let id = layer.ok_or_else(|| EngineError::Other("no active layer".into()))?;
-            let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-            let lock = l.locks.transparency && t == Target::Pixels;
-            Ok((crate::commands::paint_surface(l, p)?, lock))
+            let lock = doc.effective_locks(id).transparency && t == Target::Pixels;
+            Ok((crate::commands::paint_surface(doc, id, p)?, lock))
         }
     }
 }
 
-/// Channel surface for filters and adjustments (made explicit over the canvas), if the params
-/// target a channel.
-pub(crate) fn channel_surface_for_filter<'a>(doc: &'a mut Document, p: &Value) -> Result<Option<&'a mut Surface>> {
-    if !is_channel_target(p) {
+/// The grayscale surface filters and adjustments edit instead of the layer's pixels (made explicit
+/// over the canvas), if the params target one: an alpha channel, the Quick Mask, or the mask of
+/// `layer`.
+pub(crate) fn channel_surface_for_filter<'a>(doc: &'a mut Document, layer: Option<LayerId>, p: &Value) -> Result<Option<&'a mut Surface>> {
+    if target_of(p) == Target::Pixels {
         return Ok(None);
     }
     let b = doc.bounds();
-    let (surf, _) = target_surface(doc, None, p)?;
+    let (surf, _) = target_surface(doc, layer, p)?;
     materialize(surf, b);
     Ok(Some(surf))
+}
+
+/// Commands that edit a targeted layer mask in place of the layer: the Image › Adjustments table
+/// and the filters. A mask target enables them on any layer with a mask, so ⌘I inverts an
+/// adjustment layer's mask as in Photoshop (#780).
+fn edits_mask(id: &str) -> bool {
+    id.strip_prefix("image.adjustments.").is_some_and(|kind| crate::adjust_params::default_for(kind, ColorMode::Rgb).is_ok())
+        || crate::filters::params_for(id, &Value::Null).is_some()
+}
+
+/// The precondition of `id` when `p` targets the active layer's mask (`"target":"mask"`): the
+/// layer needs a mask. None when another precondition applies.
+pub(crate) fn mask_target_enabled(s: &Session, id: &str, p: &Value) -> Option<std::result::Result<(), String>> {
+    if target_of(p) != Target::Mask || !edits_mask(id) {
+        return None;
+    }
+    Some(crate::active_layer_of(s).and_then(|l| if l.mask.is_some() { Ok(()) } else { Err("the active layer has no layer mask".into()) }))
+}
+
+/// Whether command `id` edits the targeted channel or mask when its params name no `"target"`
+/// (filters, adjustments, paint and fill commands); the shell adds its mask target to these.
+pub fn follows_target(id: &str) -> bool {
+    routed(id)
 }
 
 /// Commands whose target follows the Channels panel.
@@ -517,6 +562,24 @@ fn routed(id: &str) -> bool {
         || id == "plugin.run"
         || id.starts_with("image.adjustments.")
         || matches!(id, "paint.stroke" | "paint.pencil" | "paint.bucket" | "paint.gradient" | "paint.mixerBrush" | "edit.fill" | "image.applyImage")
+        || crate::fill_key_cmds::IDS.contains(&id)
+        // Pasting into a targeted mask or channel (#1035).
+        || matches!(id, "edit.paste" | "edit.pasteSpecial.pasteInPlace" | "edit.pasteSpecial.pasteInto" | "edit.pasteSpecial.pasteOutside")
+        || matches!(
+            id,
+            "paint.cloneStamp"
+                | "paint.patternStamp"
+                | "paint.healingBrush"
+                | "paint.spotHealing"
+                | "paint.dodge"
+                | "paint.burn"
+                | "paint.sponge"
+                | "paint.blur"
+                | "paint.sharpen"
+                | "paint.smudge"
+                | "paint.historyBrush"
+                | "paint.redEye"
+        )
 }
 
 /// Fill in `"target"` from the targeted channel (or Quick Mask mode) when the caller gave none.
@@ -528,6 +591,8 @@ pub(crate) fn inject_target(s: &Session, id: &str, params: Value) -> Value {
     let t = match st.channel_view.target {
         ChannelTarget::Alpha(i) if i < st.doc.channels.len() => json!({ "channel": i }),
         ChannelTarget::Composite if st.doc.quick_mask.is_some() => json!("quickMask"),
+        // Viewing the active layer's mask (⌥-click): pixel commands edit the mask.
+        ChannelTarget::Composite if crate::mask_view_cmds::current(st).is_some() => json!("mask"),
         _ => return params,
     };
     match params {
@@ -1029,6 +1094,9 @@ fn target_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(list(s))
 }
 
+/// The channel shortcuts' modifier as the platform writes it, for error messages (`⌘4`, `Ctrl+4`).
+const SLOT_KEY: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+
 /// ⌘2 composite, ⌘3… colour channels then alpha channels (Photoshop CC defaults).
 fn target_slot(s: &mut Session, slot: usize) -> Result<Value> {
     let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
@@ -1038,7 +1106,7 @@ fn target_slot(s: &mut Session, slot: usize) -> Result<Value> {
         2 => ChannelTarget::Composite,
         n if n - 3 < shown_colors => ChannelTarget::Color(n - 3),
         n if n - 3 - shown_colors < doc.channels.len() => ChannelTarget::Alpha(n - 3 - shown_colors),
-        _ => return Err(EngineError::Other(format!("no channel for ⌘{slot}"))),
+        _ => return Err(EngineError::Other(format!("no channel for {SLOT_KEY}{slot}"))),
     };
     target(s, t);
     Ok(list(s))
@@ -1249,7 +1317,15 @@ fn merge(s: &mut Session, p: &Value) -> Result<Value> {
     if srcs.len() < mode.color_channels() {
         return Err(bad(cmd, format!("{mode:?} needs {} grayscale documents, got {}", mode.color_channels(), srcs.len())));
     }
-    let first = s.documents()[srcs[0]].doc.clone();
+    // Each source closes by its *current* index, so a repeated index would shift the later
+    // removals onto a document that was never named (#934). Refuse it rather than guess.
+    let mut seen = std::collections::HashSet::new();
+    if let Some(dup) = srcs.iter().find(|i| !seen.insert(**i)) {
+        return Err(bad(cmd, format!("document {dup} is listed more than once")));
+    }
+    let Some(first) = srcs.first().and_then(|&i| s.documents().get(i)).map(|d| d.doc.clone()) else {
+        return Err(bad(cmd, "bad document index"));
+    };
     let mut planes = Vec::new();
     for &i in &srcs {
         let d = &s.documents()[i].doc;
@@ -1320,8 +1396,7 @@ fn apply_image(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let id = layer.ok_or_else(|| EngineError::Other("no active layer".into()))?;
         let fmt = doc.pixel_format();
-        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        let surf = crate::commands::paint_surface(l, &Value::Null)?;
+        let surf = crate::commands::paint_surface(doc, id, &Value::Null)?;
         let sf = surf.format();
         if sf != fmt {
             return Err(EngineError::Other("the target layer's format doesn't match the document".into()));
@@ -1330,20 +1405,25 @@ fn apply_image(s: &mut Session, p: &Value) -> Result<Value> {
         let colors = sf.mode.color_channels();
         let mut v = surf.read_region(area);
         for (i, px) in v.chunks_exact_mut(n).enumerate() {
+            let base_a = if sf.alpha { px[colors].clamp(0.0, 1.0) } else { 1.0 };
             let mut w = weight(i);
-            if preserve && sf.alpha {
-                w *= px[colors].clamp(0.0, 1.0);
+            if preserve {
+                w *= base_a;
             }
             if w <= 0.0 {
                 continue;
             }
+            // Painted over the layer like a brush: the blend only acts where the layer has
+            // pixels (where it is transparent the source shows as is), and the alpha grows by
+            // source-over, so applying to an empty layer copies the source in any mode.
+            let out_a = if preserve { base_a } else { w + base_a * (1.0 - w) };
             for (c, b) in px[..colors].iter_mut().enumerate() {
                 let top = src.get(c).unwrap_or(&src[0])[i];
-                *b += (blending.apply(*b, top) - *b) * w;
+                let blended = top + (blending.apply(*b, top) - top) * base_a;
+                *b = if preserve { *b + (blended - *b) * w } else { (w * blended + base_a * (1.0 - w) * *b) / out_a };
             }
-            // Painting a transparent pixel makes it opaque, as Apply Image does on layers.
-            if !preserve && sf.alpha {
-                px[colors] = px[colors].max(w);
+            if sf.alpha {
+                px[colors] = out_a;
             }
         }
         surf.write_region(area, &v);
@@ -1416,6 +1496,7 @@ pub fn channels_json(st: &DocState) -> Value {
         "quickMask": doc.quick_mask.as_ref().map(|q| json!({ "visible": !v.quick_mask_hidden, "color": q.color.to_rgb(), "opacity": q.opacity, "indicates": q.indicates })),
         "target": v.target,
         "compositeVisible": v.visible_colors(colors) == colors,
+        "layerMaskView": crate::mask_view_cmds::view_json(st),
     })
 }
 
@@ -1448,7 +1529,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Selection…",
             ["Select"],
             None,
-            r##"{"channel":index|name|"composite"|"red|green|blue|…"|"transparency"|"mask"|"quickMask"|"selection","layer":id?,"document":index?,"invert":bool=false,"operation":"new|add|subtract|intersect"="new"}"##,
+            r##"{"channel":index|name|"composite"|"red|green|blue|…"|"transparency"|"mask"|"vectorMask"|"quickMask"|"selection","layer":id?,"document":index?,"invert":bool=false,"operation":"new|add|subtract|intersect"="new"}"##,
             has_doc,
             load_selection
         ),
@@ -1556,7 +1637,7 @@ fn slot_ok<const N: usize>(s: &Session) -> std::result::Result<(), String> {
     let d = s.active().ok_or("no document open")?;
     let colors = color_count(&d.doc);
     let shown = if colors > 1 { colors } else { 0 };
-    if N - 3 < shown + d.doc.channels.len() { Ok(()) } else { Err(format!("no channel for ⌘{N}")) }
+    if N - 3 < shown + d.doc.channels.len() { Ok(()) } else { Err(format!("no channel for {SLOT_KEY}{N}")) }
 }
 
 fn has_apply_target(s: &Session) -> std::result::Result<(), String> {
@@ -1568,6 +1649,6 @@ fn has_apply_target(s: &Session) -> std::result::Result<(), String> {
     if matches!(l.content, LayerContent::Raster(_)) {
         Ok(())
     } else {
-        Err(format!("Apply Image needs a pixel layer (active layer is a {} layer)", l.content.kind_name()))
+        Err(format!("Apply Image needs a pixel layer (active layer is {} {} layer)", l.content.article(), l.content.kind_name()))
     }
 }

@@ -103,6 +103,11 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             scale: 1.5,
             style: GradientStyle::default(),
             reverse: true,
+            opacity_stops: vec![(0.0, 1.0), (1.0, 0.25)],
+            midpoints: vec![0.3],
+            offset: (0.1, -0.2),
+            dither: true,
+            align: false,
         }),
     );
 
@@ -118,7 +123,11 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             transform: Affine::translate(10.5, 20.25),
             cache: Some(cache.clone()),
             psd_raw: Some(blob(9, 100)),
-            runs: vec![TextRun { len: 6, style: CharStyle::default() }, TextRun { len: 9, style: CharStyle::default() }],
+            runs: vec![
+                TextRun { len: 1, style: CharStyle { kerning: text::Kerning::Off, kern: 120.0, ..CharStyle::default() } },
+                TextRun { len: 5, style: CharStyle::default() },
+                TextRun { len: 9, style: CharStyle { kerning: text::Kerning::Optical, ..CharStyle::default() } },
+            ],
             paragraphs: vec![ParagraphRun { len: 15, style: ParagraphStyle::default() }],
             shape: TextShape::Box { x: 1.0, y: 2.0, width: 100.0, height: 50.0 },
             orientation: text::Orientation::Vertical,
@@ -178,6 +187,8 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             }),
             warp: Some(photocraft_geom::warp::Warp::custom(photocraft_geom::warp::BezierMesh::identity([0.0, 0.0, 48.0, 24.0], 2, 1), [0.0, 0.0, 48.0, 24.0])),
             stack_mode: Some(photocraft_doc::StackMode::Median),
+            // Distort / Perspective placement, so the round trip covers it.
+            perspective: Some([1.0, 0.1, 2.0, 0.05, 1.0, 3.0, 0.001, 0.0005, 1.0]),
         }),
     );
     let linked = Layer::new(
@@ -192,6 +203,7 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             filter_mask: None,
             warp: None,
             stack_mode: None,
+            perspective: None,
         }),
     );
     d.layers.extend([paint, group, fill, grad, text, shape, smart, linked]);

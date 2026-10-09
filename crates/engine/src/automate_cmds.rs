@@ -5,7 +5,7 @@
 //! "Scripts" are PhotoCraft action scripts: JSON (`[[id, params], …]`, `{"steps": …}` or a
 //! droplet) or a plain-text list with one `command.id {json params}` per line (`#` comments).
 //! Droplets are JSON files (`.pcdroplet`) holding an action plus batch options; `photocraft-cli
-//! droplet <file> <inputs…>` runs one, and on macOS/Linux a `.command` shim makes it
+//! droplet <file> <inputs…>` runs one, and on Unix a `.command` shim makes it
 //! double-clickable / drop-target-able from the shell.
 //!
 //! Script events (Start Application, New / Open / Save / Close Document, Print, Export) are
@@ -50,14 +50,7 @@ pub fn parse_script(text: &str) -> Result<Vec<(String, Value)>> {
     let t = text.trim_start_matches('\u{feff}').trim();
     if t.starts_with('[') || t.starts_with('{') {
         let v: Value = serde_json::from_str(t).map_err(|e| bad(cmd, format!("script JSON: {e}")))?;
-        let steps = match &v {
-            Value::Array(_) => &v,
-            Value::Object(o) => {
-                o.get("steps").or_else(|| o.get("action").and_then(|a| a.get("steps").or(Some(a)))).ok_or_else(|| bad(cmd, "script object needs \"steps\""))?
-            }
-            _ => return Err(bad(cmd, "script JSON must be an array of steps or an object")),
-        };
-        return parse_steps(steps, cmd);
+        return parse_action(&v, cmd);
     }
     let mut out = Vec::new();
     for (n, line) in t.lines().enumerate() {
@@ -70,6 +63,20 @@ pub fn parse_script(text: &str) -> Result<Vec<(String, Value)>> {
         out.push((id.to_string(), params));
     }
     Ok(out)
+}
+
+/// The steps of a JSON action: an array of steps (`[id, params]`, `{"command", "params"}` or a
+/// bare id), `{"steps"|"action": …}` (a recorded action) or a droplet. `cmd` names the caller in
+/// errors.
+pub fn parse_action(v: &Value, cmd: &str) -> Result<Vec<(String, Value)>> {
+    let steps = match v {
+        Value::Array(_) => v,
+        Value::Object(o) => {
+            o.get("steps").or_else(|| o.get("action").and_then(|a| a.get("steps").or(Some(a)))).ok_or_else(|| bad(cmd, "an action object needs \"steps\""))?
+        }
+        _ => return Err(bad(cmd, "an action must be an array of steps or an object")),
+    };
+    parse_steps(steps, cmd)
 }
 
 fn parse_steps(v: &Value, cmd: &str) -> Result<Vec<(String, Value)>> {
@@ -291,7 +298,7 @@ fn create_droplet(s: &mut Session, p: &Value) -> Result<Value> {
     let droplet = json!({"photocraftDroplet": 1, "name": name, "action": {"name": name, "steps": steps_json}, "options": options});
     let text = serde_json::to_string_pretty(&droplet).unwrap_or_default();
     write_file(&path, text.as_bytes())?;
-    let shim = p.get("shim").and_then(Value::as_bool).unwrap_or(cfg!(any(target_os = "macos", target_os = "linux")));
+    let shim = p.get("shim").and_then(Value::as_bool).unwrap_or(cfg!(unix));
     let shim_path = if shim { Some(write_shim(&path)?) } else { None };
     let _ = s;
     Ok(json!({"path": path, "shim": shim_path, "steps": steps.len()}))
@@ -307,7 +314,7 @@ fn write_shim(droplet: &str) -> Result<String> {
         "#!/bin/sh\n# PhotoCraft droplet: runs the action on the files given (or dropped).\nexec \"${{PHOTOCRAFT_CLI:-photocraft-cli}}\" droplet \"{}\" \"$@\"\n",
         abs.replace('"', "\\\"")
     );
-    std::fs::write(&shim, body).map_err(|e| EngineError::Other(format!("{shim}: {e}")))?;
+    crate::file_cmds::write_file(&shim, body.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -526,7 +533,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.automate.createDroplet",
             "Create Droplet…",
             &["File", "Automate"],
-            r##"{"path":str (.pcdroplet),"steps":[[id,params]…] (the action),"name":str?,"output":folder?,"format":"same|png|jpg|…"?,"quality":0..12?,"shim":bool=true on macOS/Linux (writes <name>.command calling `photocraft-cli droplet`)} → {path, shim}"##,
+            r##"{"path":str (.pcdroplet),"steps":[[id,params]…] (the action),"name":str?,"output":folder?,"format":"same|png|jpg|…"?,"quality":0..12?,"shim":bool=true on Unix (writes <name>.command calling `photocraft-cli droplet`)} → {path, shim}"##,
             native,
             create_droplet
         ),
@@ -534,7 +541,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.automate.runDroplet",
             "Run Droplet",
             &[],
-            r##"{"droplet":path,"input":[files or folders],"output":folder? (default: droplet's, else <input folder>/droplet-output)} → {files, errors}"##,
+            r##"{"droplet":path,"input":[files or folders],"output":folder? (default: droplet's, else <input folder>/droplet-output)} → {files, errors} (an input whose output name was already written in the run goes to errors)"##,
             native,
             run_droplet
         ),

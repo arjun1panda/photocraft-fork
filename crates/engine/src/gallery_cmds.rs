@@ -21,7 +21,7 @@ fn colour(v: Option<&Value>) -> Option<[f32; 4]> {
             Some([c(0, 0.0), c(1, 0.0), c(2, 0.0), c(3, 1.0)])
         }
         Value::String(h) if h.len() == 7 && h.starts_with('#') => {
-            let ch = |j: usize| u8::from_str_radix(&h[j..j + 2], 16).map_or(0.0, |v| v as f32 / 255.0);
+            let ch = |j: usize| h.get(j..j + 2).and_then(|s| u8::from_str_radix(s, 16).ok()).map_or(0.0, |v| v as f32 / 255.0);
             Some([ch(1), ch(3), ch(5), 1.0])
         }
         _ => None,
@@ -63,6 +63,9 @@ pub fn effect_from_json(filter: GalleryFilter, p: &Value, fallback: &Value) -> G
 /// `filter`); hidden entries are skipped.
 pub fn effects_from_json(p: &Value) -> std::result::Result<Vec<GalleryEffect>, String> {
     let Some(list) = p.get("effects").and_then(Value::as_array) else { return Ok(Vec::new()) };
+    if list.len() > 32 {
+        return Err("too many effects in filterGallery stack (max 32)".into());
+    }
     let mut out = Vec::new();
     for (k, item) in list.iter().enumerate() {
         if item.get("visible").and_then(Value::as_bool) == Some(false) {

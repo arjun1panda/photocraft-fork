@@ -1,6 +1,7 @@
 //! Layer comps (resource 1065 + per-layer `cmls`) and artboards (`artb`) through PSD and
 //! `.pcraft`: byte-exact while unchanged, regenerated after edits.
 
+#[cfg(feature = "corpus")]
 use std::path::PathBuf;
 
 use photocraft_color::{BlendMode, Color, ColorMode, PixelFormat, SampleType};
@@ -11,9 +12,10 @@ use photocraft_io::comps_map::LAYER_COMPS;
 use photocraft_io::{ExportOptions, export, import};
 use photocraft_psd::PsdFile;
 
-fn corpus(rel: &str) -> Option<Vec<u8>> {
+#[cfg(feature = "corpus")]
+fn corpus(rel: &str) -> Vec<u8> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/psd").join(rel);
-    std::fs::read(p).ok()
+    std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}: run `cargo xtask corpus --all`", p.display()))
 }
 
 fn to_psd(doc: &Document) -> Vec<u8> {
@@ -24,9 +26,10 @@ fn layer_block<'a>(f: &'a PsdFile, name: &str, key: &[u8; 4]) -> Option<&'a [u8]
     f.layers().iter().find(|r| r.name() == name).and_then(|r| r.block(key)).map(|b| b.data.as_slice())
 }
 
+#[cfg(feature = "corpus")]
 #[test]
 fn corpus_layer_comps_import_and_verbatim_export() {
-    let Some(bytes) = corpus("ag-psd/read-write/layer-comps/src.psd") else { return };
+    let bytes = corpus("ag-psd/read-write/layer-comps/src.psd");
     let src = PsdFile::from_bytes(&bytes).unwrap();
     let doc = import("src.psd", &bytes).unwrap().document;
     let names: Vec<_> = doc.layer_comps.iter().map(|c| c.name.as_str()).collect();
@@ -86,9 +89,10 @@ fn corpus_layer_comps_import_and_verbatim_export() {
     }
 }
 
+#[cfg(feature = "corpus")]
 #[test]
 fn corpus_artboards_import_and_verbatim_export() {
-    let Some(bytes) = corpus("psd-tools/gradient-sizes.psd") else { return };
+    let bytes = corpus("psd-tools/gradient-sizes.psd");
     let src = PsdFile::from_bytes(&bytes).unwrap();
     let doc = import("g.psd", &bytes).unwrap().document;
     let boards = doc.artboards();
@@ -216,4 +220,94 @@ fn synthetic_pcraft_roundtrip_keeps_everything() {
     let c = &fresh.layer_comps[0];
     assert_eq!(c.states.len(), fresh.layer_count());
     assert!(c.states.iter().all(|s| fresh.layer(s.layer).is_some()));
+
+    // Native identity is independent of ZIP entry order and the filename extension.
+    let zip = photocraft_format::zip::ZipReader::new(&bytes).unwrap();
+    let mut reordered = photocraft_format::zip::ZipWriter::new();
+    reordered.add("extra.txt", b"not the manifest").unwrap();
+    for entry in &zip.entries {
+        reordered.add(&entry.name, &zip.read(entry, bytes.len()).unwrap()).unwrap();
+    }
+    let reordered = reordered.finish().unwrap();
+    for name in ["x.PCRAFT", "no-extension"] {
+        let imported = import(name, &reordered).unwrap().document;
+        assert_eq!(imported.layer_comps, d.layer_comps);
+        assert_eq!(imported.layers[1].artboard(), d.layers[1].artboard());
+    }
+
+    let png = export(&d, "x.png", &ExportOptions::default()).unwrap().bytes;
+    assert!(import("pcraft", &png).is_ok());
+    assert!(matches!(import("broken.pcraft", b"not a native bundle"), Err(photocraft_io::IoError::Pcraft(_))));
+}
+
+/// A layer at (4, 4) whose preserved `shmd` block offsets it by `(dx, 0)` in comp 1, plus the
+/// matching resource 1065: what a PSD with that comp data imports to before decoding comps.
+fn doc_with_raw_comp_offset(dx: i32) -> Document {
+    use photocraft_psd::descriptor::{Descriptor, UnicodeString, Value, VersionedDescriptor};
+    use photocraft_psd::metadata::{MetadataItem, write_shmd};
+    let obj = |class: &str| Descriptor { name: UnicodeString(vec![0]), ..Descriptor::new(class) };
+    let mut d = Document::new("s", Size::new(32, 32), ColorMode::Rgb, SampleType::U8);
+    let mut l = Layer::raster("A", PixelFormat::RGBA8);
+    l.surface_mut().unwrap().fill_rect(Rect::new(4, 4, 8, 8), &[1.0, 0.0, 0.0, 1.0]);
+    let setting = obj("null")
+        .with("enab", Value::Boolean(false))
+        .with("compList", Value::List(vec![Value::Integer(1)]))
+        .with("Ofst", Value::Descriptor(obj("null").with("Hrzn", Value::Integer(dx)).with("Vrtc", Value::Integer(0))));
+    let cmls = VersionedDescriptor::new(Descriptor::new("null").with("layerSettings", Value::List(vec![Value::Descriptor(setting)]))).to_bytes();
+    l.psd_blocks = vec![(*b"shmd", std::sync::Arc::new(write_shmd(&[MetadataItem::new(*b"cmls", cmls)])))];
+    d.layers.push(l);
+    let comp = Descriptor::new("Comp")
+        .with("Nm  ", Value::Text(UnicodeString::new_nul("One")))
+        .with("compID", Value::Integer(1))
+        .with("capturedInfo", Value::Integer(3));
+    let res = VersionedDescriptor::new(Descriptor::new("CompList").with("list", Value::List(vec![Value::Descriptor(comp)]))).to_bytes();
+    d.metadata.psd_resources.push((LAYER_COMPS, String::new(), std::sync::Arc::new(res)));
+    d
+}
+
+#[test]
+fn out_of_range_comp_offsets_import_and_export_without_panic() {
+    // #1017: an `Ofst` that puts the layer past i32 range panicked on import and on export (the
+    // unchanged-comps check decodes the preserved data). The position is dropped with a warning,
+    // the rest of the comp survives, and the file data is still written back verbatim.
+    let mut src = doc_with_raw_comp_offset(i32::MAX);
+    (src.layer_comps, src.last_applied_comp, src.last_document_state) =
+        photocraft_io::comps_map::comps_from_psd(src.metadata.psd_resources.last().map(|r| r.2.as_slice()), &src);
+    let bytes = to_psd(&src);
+    let imported = import("x.psd", &bytes).unwrap();
+    assert!(imported.warnings.iter().any(|w| w.contains("layer comp position")), "{:?}", imported.warnings);
+    let c = &imported.document.layer_comps[0];
+    assert_eq!((c.name.as_str(), c.states.len()), ("One", 1));
+    assert_eq!((c.states[0].visible, c.states[0].position), (Some(false), None));
+    let a = PsdFile::from_bytes(&bytes).unwrap();
+    let b = PsdFile::from_bytes(&to_psd(&imported.document)).unwrap();
+    assert_eq!(layer_block(&a, "A", b"shmd"), layer_block(&b, "A", b"shmd"));
+
+    // Export of a stored position whose offset from the layer is out of range (no preserved
+    // data, so `cmls` is regenerated): the offset is left out and reads back as no position.
+    let mut d = Document::new("s", Size::new(32, 32), ColorMode::Rgb, SampleType::U8);
+    let mut l = Layer::raster("A", PixelFormat::RGBA8);
+    l.surface_mut().unwrap().fill_rect(Rect::new(4, 4, 8, 8), &[1.0, 0.0, 0.0, 1.0]);
+    let st = photocraft_doc::CompLayerState { layer: l.id, visible: Some(false), position: Some((i32::MIN, 0)), appearance: None };
+    d.layers.push(l);
+    d.layer_comps.push(LayerComp {
+        id: 1,
+        name: "One".into(),
+        comment: String::new(),
+        apply_visibility: true,
+        apply_position: true,
+        apply_appearance: false,
+        states: vec![st],
+    });
+    let back = import("x.psd", &to_psd(&d)).unwrap().document;
+    let s = &back.layer_comps[0].states[0];
+    assert_eq!((s.visible, s.position), (Some(false), None));
+
+    // Control: an ordinary offset imports as layer origin + offset, without a warning.
+    let mut ok = doc_with_raw_comp_offset(6);
+    (ok.layer_comps, ok.last_applied_comp, ok.last_document_state) =
+        photocraft_io::comps_map::comps_from_psd(ok.metadata.psd_resources.last().map(|r| r.2.as_slice()), &ok);
+    let imported = import("x.psd", &to_psd(&ok)).unwrap();
+    assert!(!imported.warnings.iter().any(|w| w.contains("layer comp")), "{:?}", imported.warnings);
+    assert_eq!(imported.document.layer_comps[0].states[0].position, Some((10, 4)));
 }

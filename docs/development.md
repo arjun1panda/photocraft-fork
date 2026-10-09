@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust stable (1.90+). Add the web target with `rustup target add wasm32-unknown-unknown`.
+- Rust stable (1.95+). Add the web target with `rustup target add wasm32-unknown-unknown`.
 - macOS, Windows or Linux. Linux needs `libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev`.
 
 ## Build and run
@@ -19,19 +19,62 @@ cargo xtask parity                                         # Photoshop menu cove
 
 Image code is slow at `opt-level 0`, so the workspace profile builds dependencies at `opt-level 2`. Use `--release` for anything interactive.
 
+## Fonts (craft-fonts)
+
+Font assets shared by the Crafting Apps live in [storytold/craft-fonts](https://github.com/storytold/craft-fonts), never in this repo: don't commit font files here (Inter and JetBrains Mono in `assets/fonts/` are the only exceptions; new fonts go to craft-fonts). The rules are in `craftrules/standards/fonts.md` in a sibling `craftrules` checkout (see below); that repository is not public, so outside contributors can ask a maintainer for the rules that apply to their change.
+
+craft-fonts is an **optional build input**, never a Cargo dependency:
+
+```sh
+git clone https://github.com/storytold/craft-fonts ../craft-fonts
+CRAFT_FONTS_DIR="$PWD/../craft-fonts" cargo run --release -p photocraft
+CRAFT_FONTS_DIR="$PWD/../craft-fonts" cargo test --workspace     # runs the Japanese font tests too
+```
+
+- Use an absolute path (`$PWD/...`): `build.rs` runs in `crates/text`, so a relative `CRAFT_FONTS_DIR` would resolve from there.
+- `crates/text/build.rs` reads `$CRAFT_FONTS_DIR/fonts/manifest.txt` and embeds the fonts as `photocraft_text::CRAFT_FONTS` (`crates/text/src/craft_fonts.rs`). Unset, `CRAFT_FONTS` is empty and the build is unchanged. A bad path is a build warning, or an error with `CRAFT_FONTS_REQUIRED=1` (release builds set both).
+- **UI:** the Japanese fonts (BIZ UDPGothic Regular first) are the first Japanese fallback in the lazy CJK loader (`crates/ui-egui/src/cjk_fonts.rs`), ahead of the system Japanese fonts and in the same locale script order, appended last to every egui family with the usual baseline alignment.
+- **Type tool:** the text engine registers them in `FontDb::new` (so also with no system fonts) and puts them first in the Japanese slot of the locale-ordered fallback list: BIZ UDPGothic for sans runs, Shippori Mincho / BIZ UDMincho for serif runs.
+- **Web:** the wasm32 build never embeds craft-fonts, even with `CRAFT_FONTS_DIR` set: measured on 2026-10-06, the UI face alone took the release wasm from 24.19 MB to 28.87 MB, over the 24 MiB gate in `packaging/web/package.sh`. The web build therefore has no Japanese font yet (loading craft-fonts next to the wasm at run time would be the way to add one).
+- Tests that need the fonts skip with a message when `CRAFT_FONTS` is empty; CI's Linux job runs the tests a second time with `CRAFT_FONTS_DIR` set. Desktop releases check out craft-fonts at the commit pinned in `.github/workflows/release.yml` (`CRAFT_FONTS_REF`; ci.yml pins the same commit) and ship each font's `OFL.txt` as `OFL-<family>.txt`.
+
+## Graphics startup and device loss
+
+`--safe-gpu` starts with the CPU renderer for one launch (no GPU canvas; a software adapter for the window where the platform has one: WARP on Windows, llvmpipe over GL on Linux). Before creating the wgpu device the app writes and locks `gpu-starting.json` in the config directory; it clears it once the first frames have rendered. A launch that finds an unlocked marker knows the previous start died inside the graphics driver (#4) and uses the next safer backend (Windows: Vulkan → DX12 → CPU; Linux: Vulkan → GL → CPU; macOS: Metal → CPU), remembering it in `performance.gpuBackend` (Preferences › Performance › GPU Backend, with **Reset GPU Backend**). With `auto`, Intel adapters on Windows use DX12. Help › System Info shows the adapter, backend, driver and fallback state.
+
+On DX12 the shader compiler is FXC (`d3dcompiler_47.dll`, part of Windows), or a `dxcompiler.dll` placed beside `photocraft.exe`, loaded by its full path. wgpu's default looks `dxcompiler.dll` up by name, which reaches the current directory and `PATH` and loaded other programs' incompatible builds (#712).
+
+Handled windowing and app initialization errors clear this launch's startup marker, restoring any
+prior crash evidence. For example, a Linux launch without `DISPLAY` or `WAYLAND_DISPLAY` does not
+change the next launch's graphics backend. Renderer initialization errors and driver crashes still
+keep the marker for recovery.
+
+If the device is lost while running (#243), every GPU entry point checks the device's health flag first, the canvas switches to the CPU compositor for the rest of the session and a notice says "GPU device was lost; using the CPU renderer." `ui.gpu.simulateLoss` triggers this path from the control channel.
+
+## Logs
+
+The desktop app writes its `log` records to standard error and to `logs/photocraft.log` in the settings directory (Linux `~/.config/photocraft/logs/`, macOS `~/Library/Application Support/Photocraft/logs/`, Windows `%APPDATA%\Photocraft\logs\`, or under `PHOTOCRAFT_CONFIG_DIR` / the portable data folder). A start launched from a desktop menu or the Dock has no terminal, so this file is what to attach to a bug report: GPU startup fallbacks, a lost device and the crash guard's panic report all land there. Each launch moves the previous log to `photocraft.1.log` (and that one to `photocraft.2.log`), so the log of a run that crashed survives the next start. The file stops growing at 16 MiB. `--version` and command-line errors write no file.
+
+By default PhotoCraft's own crates log at `info` and everything else at `warn`. `RUST_LOG` replaces that with env_logger-style directives, for example `RUST_LOG=debug`, `RUST_LOG=warn,photocraft_gpu=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`photocraft*=debug`). The logger is `apps/photocraft/src/logging.rs`; the web build logs to the browser console instead.
+
 ## Environment variables
 
 | Variable | Effect |
 |---|---|
 | `PHOTOCRAFT_CONTROL_PORT` | Same as `--control <port>` |
+| `RUST_LOG` | Log levels for standard error and the log file (see [Logs](#logs)) |
 | `PHOTOCRAFT_CONTROL_TOKEN` | 64-hex bearer token for control TCP (avoid on shared systems where environment inspection is possible) |
 | `PHOTOCRAFT_CONTROL_TOKEN_FILE` | Read, or create for a server, the control bearer-token file |
 | `PHOTOCRAFT_AUTOMATION_READ_ROOT` | Directory capability for automation reads; requests use relative paths |
 | `PHOTOCRAFT_AUTOMATION_WRITE_ROOT` | Separate directory capability for automation writes; requests use relative paths |
 | `PHOTOCRAFT_CPU_CANVAS=1` | Force the CPU canvas path instead of the wgpu shader canvas |
+| `PHOTOCRAFT_NATIVE_WAYLAND=1` | Linux: stay on native Wayland when a pen is attached (by default the window then opens through Xwayland, because Wayland gives the app no pen input; #639) |
+| `WGPU_BACKEND=dx12` | Pick the wgpu backend(s) (`vulkan`, `dx12`, `metal`, `gl`); overrides `performance.gpuBackend` and the startup fallback |
+| `WGPU_DX12_COMPILER=fxc` | DX12 shader compiler (`fxc`, `dxc`, `auto`); `dxc` and `auto` look `dxcompiler.dll` up through the DLL search path |
 | `PHOTOCRAFT_GPU_TILE=2048` | Force GPU canvas tiling (tests tile seams) |
 | `PHOTOCRAFT_FX_NOCACHE=1` | Bypass the CPU layer-effect map cache (`compose::effect_maps`) |
 | `PHOTOCRAFT_CPU_COMPOSE=1` | Keep the wgpu canvas but composite on the CPU (compare GPU vs CPU renders, e.g. with the snapshot example) |
+| `PHOTOCRAFT_LOCALE` | Override Auto's native UI language for this launch; unsupported tags use English. See [system language detection](localization.md#first-launch-and-system-language). |
 | `PHOTOCRAFT_FX_TRACE=1` | Print the CPU time spent on GPU effect shapes and distance fields per rebuild |
 | `PHOTOCRAFT_THEME_FILE=tokens.json` | **Debug builds only:** live design-token overrides, re-read on change |
 
@@ -68,13 +111,13 @@ See `docs/control-protocol.md` for every method. Tips:
 cargo run -p photocraft-cli -- convert in.psd out.pcraft               # any supported format -> any
 cargo run -p photocraft-cli -- info out.pcraft                          # JSON: size, mode, depth, layer tree
 cargo run -p photocraft-cli -- run in.png --cmd layer.new.layer --params '{"name":"Ink"}' \
-                                          --cmd filter.blur.gaussian --params '{"radius":3}' --out out.psd
+                                          --cmd filter.blur.gaussianBlur --params '{"radius":3}' --out out.psd
 cargo run -p photocraft-cli -- run --new '{"width":800,"height":600}' --cmd document.inspect
 cargo run -p photocraft-cli -- batch --actions actions.json --in photos/ --out done/ --format jpg
 cargo run -p photocraft-cli -- commands --filter blur                    # the command registry
 ```
 
-`actions.json` is `[{"command": "<id>", "params": {…}}, …]`, which is the same shape as a recorded action. `run` prints one JSON line per command result.
+`actions.json` holds the steps of a recorded action: `[["<id>", {…}], …]`, `[{"command": "<id>", "params": {…}}, …]` or bare ids, as a list or wrapped in `{"actions": …}` or `{"steps": …}`; a droplet file works too. `batch` refuses an `--out` folder that is the `--in` folder, since the results would replace the originals, unless `--in-place` is given. `run` prints one JSON line per command result.
 
 ## Native format (.pcraft)
 
@@ -84,7 +127,7 @@ cargo run -p photocraft-cli -- commands --filter blur                    # the c
 - `tiles/<blake3>.zst` and `blobs/<blake3>.zst`: zstd-compressed objects, content-addressed by the BLAKE3 hash of their uncompressed bytes.
 - `thumb.png` and `composite/preview.png`: previews.
 
-Keep one `PcraftWriter` per open document: re-saving then only compresses and writes tiles that changed, and directory bundles garbage-collect unreferenced objects. `format::Autosaver` writes snapshots into a recovery directory on a background thread. `list_recovery` / `recover` / `discard_recovery` implement crash recovery.
+Keep one `PcraftWriter` per open document: re-saving then only compresses and writes tiles that changed. Directory bundles verify objects on first encounter in a folder; later saves reuse them while their file size and modification time are unchanged, and re-verify changed objects, repair missing or damaged objects, and garbage-collect unreferenced ones. `format::Autosaver` writes snapshots into a recovery directory on a background thread. `list_recovery` / `recover` / `discard_recovery` implement crash recovery, and `format::RecoveryStore` is the lifecycle the desktop app uses: new documents autosave under per-launch keys (document ids restart every launch, so they never overwrite an older entry), and a recovered document adopts the entry it came from. That entry is replaced in place by the next autosave and removed only when the document is saved or closed, never just because it was recovered, so a second crash loses nothing. The web build has no crash recovery (no autosave services).
 
 `photocraft-io` routes `.pcraft` through this crate in `import`/`export`, detecting it by magic or by extension.
 
@@ -100,6 +143,7 @@ Tools:
 - `session_list`
 - `doc_open`, `doc_new`, `doc_save`, `doc_export`, `doc_inspect`, `doc_render_preview` (returns a PNG image), `doc_select`, `doc_close`
 - `command_list`, `command_run`, `command_batch` (several commands per call)
+- `jobs_list` (running background jobs with progress, then recently finished ones with their result or error), `jobs_cancel` (one job by id, or every running job)
 - bridge only: `ui_inspect`, `ui_screenshot`, `ui_pointer`, `ui_menu_invoke`, `ui_set`, `control_call`
 
 Claude Code (`.mcp.json` in the repo root, or `claude mcp add`):
@@ -138,7 +182,7 @@ A typical agent loop:
 
 1. `doc_open {path}`
 2. `command_list {filter:"blur"}`
-3. `command_run {id:"filter.blur.gaussian", params:{radius:4}}`
+3. `command_run {id:"filter.blur.gaussianBlur", params:{radius:4}}`
 4. `doc_render_preview` to check the result
 5. `doc_save {path:"out.pcraft"}`
 
@@ -161,6 +205,12 @@ intents, black point compensation). It ships CC0 built-in profiles, including a 
 the live command registry (`menus::is_live`) and rewrites [`docs/parity.md`](parity.md). The test
 `parity::tests::parity_does_not_regress` fails if the live count drops below `parity::FLOOR`.
 
+`cargo xtask i18n-coverage` prints the UI translation coverage for each language in the
+`crates/ui-egui/src/i18n/mod.rs` registry, in stable language-code order. Its English-key set is
+derived from UI `tl!` literals, the menu catalog and UI command table, and menu command labels in
+the engine source. Catalog rows are validated for malformed and duplicate keys; unused legacy
+translations do not affect the denominator. Unregistered locale TSV files are ignored.
+
 ## Testing strategy
 
 - **Unit and property tests** in every crate. proptest is used for tile COW, regions and codecs.
@@ -169,7 +219,7 @@ the live command registry (`menus::is_live`) and rewrites [`docs/parity.md`](par
   - byte-exact round trips
   - malformed-input sweeps (truncate at every offset)
   - fuzz targets (`crates/*/fuzz`)
-- **Real-file corpus** in `corpus/` (gitignored). `corpus/psd` holds MIT-licensed test PSDs, listed with their sources in `corpus/psd/SOURCES.md`, and `cargo xtask corpus --download` fetches PngSuite. Tests skip silently when a corpus is absent.
+- **Real-file corpora** in `corpus/` (gitignored, fetched at pinned commits, sha256-verified): opt-in locally through the `corpus` cargo feature, always run in CI. See [Test corpora](#test-corpora).
 - **Composite oracle:** a PSD's embedded merged image is compared with our compositor's output. The pass rate is tracked in the roadmap.
 - **UI:** unit tests for widgets and state, plus screenshot checks through the control channel.
 
@@ -185,6 +235,60 @@ the live command registry (`menus::is_live`) and rewrites [`docs/parity.md`](par
 - `ui.inspect` returns `perf` timings (UI ms per frame, composite ms, upload ms).
 - Never scan full surfaces per frame. Cache per document revision (`PhotocraftApp::cached_bounds`). An uncached `content_bounds()` on a 36 MP layer once cost 77 ms per frame.
 
+## Scorecard and performance budgets
+
+[`docs/scorecard.md`](scorecard.md) says, with numbers, where PhotoCraft stands per area. It is
+generated; never edit it by hand.
+
+```sh
+cargo xtask scorecard            # regenerate docs/scorecard.md
+cargo xtask scorecard --check    # what CI runs: fails if the committed file is stale
+cargo xtask perf                 # full benchmark run (tens of minutes, release build)
+cargo xtask perf --quick         # small synthetic documents (about a minute once built)
+cargo xtask perf --update-baseline   # also write perf/baseline.json from this run
+```
+
+**Sources.** The scorecard reads only committed files, so it is deterministic:
+- `scorecard/*.toml`: one checklist per area (tools, file compatibility, UI, type, automation,
+  reliability, distribution, open bugs). Each item has an `id`, a short `target`, a `status`
+  (`done`, `partial` or `missing`), the `issue` and a `note` with the evidence (file:line).
+  Statuses must be true on `main`: verify against the code, and say `partial` with a note when
+  unsure. Flip a row in the PR that changes it.
+- `perf/budgets.toml`: the benches `xtask perf` runs and the scenarios P1…Pn, each mapped to one
+  bench row, with a budget (targets from #209, #210, #211). `enforce = false` marks a target the
+  code doesn't meet yet (reported as over budget; only regressions fail); flip it to `true` in the
+  PR that meets it. Scenarios the code can't support yet carry `not_measurable` and a reason, never
+  a number.
+- `perf/baseline.json`: the numbers the scorecard shows, written only by
+  `cargo xtask perf --update-baseline`, with the machine (CPU, RAM, GPU adapter, OS), its machine
+  class, commit, date and load average.
+- `crates/io/tests/corpus.rs`: the corpus floors (every `Source { .. }` constant).
+- The prefs audit: `Preferences` fields that no code reads (target 0, #204), plus counts taken
+  from the tree (never-crash attribute coverage, `docs/parity.md`).
+
+**Perf runs.** `xtask perf` builds the benches in release (`perf_scenarios`, `interactive_bench`,
+`fx_bench`, `type_bench`, `large_image_bench`, and `layout_bench` once it exists), runs each with
+`--json`, and merges the reports into `target/perf/results.json` keyed by scenario id, with p50,
+p95 and max (nearest rank over the samples), peak RSS measured in-process (`photocraft-testkit`'s
+`perf::RssSampler`), GPU bytes held by the canvas, and the load average before and after each
+bench. `target/perf/summary.md` is the Markdown table. It exits non-zero when an enforced budget
+breaks, when a scenario's p50 regresses more than 15 % (`--threshold`, or `regression_pct`)
+against a baseline from the same machine class and mode, or when a bench fails. Runs from
+different machine classes are never compared, and `--quick` numbers are only compared with a
+quick baseline. Machines that run other work give noisy numbers: check the load average in the
+summary before trusting a regression, and record it next to any number you quote.
+
+**Adding a scenario.** Add a row to a bench (keep its name stable: it is the key), give the
+bench `--json` support through `photocraft_testkit::perf::{row, report, write_report}`, then add a
+`[[scenario]]` to `perf/budgets.toml` and run `cargo xtask scorecard`.
+
+**CI.** `ci.yml` runs `cargo xtask scorecard --check`. `perf-nightly.yml` runs `cargo xtask perf`
+on a fixed macOS runner every night (and on demand), posts the table as the job summary, uploads
+`results.json`, and fails on a broken budget or regression. It never runs on pull requests: the
+release build of the benches alone takes longer than PR CI should. To give the nightly runner
+its own baseline, run the workflow by hand with `update_baseline` and commit the `perf-baseline`
+artifact as `perf/baseline.json`.
+
 ## Web build
 
 `apps/photocraft-web` runs the same `PhotocraftApp` in the browser through eframe's web runner. The renderer is wgpu: WebGPU where the browser has it, WebGL2 otherwise. It is Rust only. The only JavaScript is the glue that wasm-bindgen generates.
@@ -196,15 +300,26 @@ trunk build --release              # writes ../../dist/web (index.html, .js glue
 trunk serve --release              # dev server on http://127.0.0.1:8765
 ```
 
-Any static file server works for `dist/web`, for example `python3 -m http.server 8765` run inside that directory. Trunk downloads the matching `wasm-bindgen` and `wasm-opt` itself. The release `.wasm` is about 12.7 MB, or 5.0 MB gzipped. Serve it with compression.
+Any static file server works for `dist/web`, for example `python3 -m http.server 8765` run inside that directory. Trunk downloads the matching `wasm-bindgen` and `wasm-opt` itself. `trunk build --release` uses the `wasm-release` Cargo profile (`data-cargo-profile` in `index.html`: fat LTO, opt-level "s" except the pixel crates). The `.wasm` is about 18.8 MiB raw, 7.8 MiB gzipped and 5.6 MiB with Brotli; serve it with compression. Keep it under 24 MiB (`packaging/web/package.sh` enforces this; Cloudflare's per-file cap is 25 MiB). The web build never embeds craft-fonts (see Fonts above). To see where the bytes go, run `twiggy top -n 40` on `target/wasm32-unknown-unknown/wasm-release/photocraft-web.wasm` (before wasm-opt strips the names).
 
 URL flags: `?webgl` forces the WebGL2 backend, and `?cpu` forces the CPU canvas path.
+
+To build and serve the web app entirely in Docker, run from the repository root:
+
+```sh
+docker build --load -t photocraft-web:local .
+docker run --rm -p 8080:8080 photocraft-web:local
+```
+
+Open http://localhost:8080/. See [Docker hosting](../packaging/web/README.md#docker) for
+HTTPS/reverse-proxy deployment and browser limitations.
 
 How the web shell (`apps/photocraft-web/src/web.rs`) differs from desktop:
 
 - **Open** uses `rfd::AsyncFileDialog`. The bytes arrive asynchronously in `Services::inbox`, which the app drains every frame.
 - **Save / Save As / Export** trigger a browser download of the encoded bytes. The shell does this with a Blob, an object URL and a temporary `<a download>`, all created from Rust. There is no save dialog, so the suggested name becomes the download name.
 - **Drag-and-drop:** `WebShell` takes the frame's `dropped_files` before the app sees them. It reads each file with `DroppedFile::bytes_async` and pushes the bytes into the inbox.
+- **Startup failures:** `index.html` shows "Loading PhotoCraft…" until the app removes it, or replaces it with the error when the web runner fails to start. If the `.wasm` never downloads or doesn't match the page's `.js` (a stale cached `index.html` after a deploy), no Rust runs at all, so the page itself (CSS only, no script) adds a hint with a Reload link after 20 seconds.
 - **No control server:** browsers can't listen on TCP. To automate the web build, drive headless Chrome with `--remote-debugging-port`. `Page.setInterceptFileChooserDialog` plus `DOM.setFileInputFiles` covers Open, `Input.dispatchDragEvent` with `files` covers drops, and `Browser.setDownloadBehavior` captures downloads.
 - Headless Chrome on macOS (`--headless=new --enable-unsafe-webgpu`) gets a real WebGPU adapter.
 
@@ -226,10 +341,82 @@ Input calls (`ui.key`, `ui.type`, `ui.click`) now reply only after the app has p
 so a following `ui.inspect` observes their effect.
 
 
+## Test corpora
+
+Real files are our best oracles, but they are large binaries, so they never go into this
+repository. They live in `corpus/` (gitignored) and are fetched at **pinned commits** and checked
+against committed **sha256 manifests**. All pins are in one place:
+[`xtask/src/corpus_pins.rs`](../xtask/src/corpus_pins.rs).
+
+| Directory | What | Source | Manifest |
+|---|---|---|---|
+| `corpus/photoshop/` | 256 PSDs we authored with Photoshop: smart filters, layer-style effect shapes, the text engine, adjustments in every mode and depth | https://github.com/storytold/photocraft-corpus (ours, MIT OR Apache-2.0) | `xtask/photoshop-corpus.sha256` |
+| `corpus/psd/` | 170 small psd-tools and ag-psd files, the mix most PSD tests use | psd-tools and ag-psd upstreams (MIT) | `xtask/psd-corpus.sha256` |
+| `corpus/psd-tools/` | the complete psd-tools test set (309 files) | psd-tools upstream (MIT) | `xtask/psd-tools-corpus.sha256` |
+| `corpus/heif/` | 9 small HEIC/HEIF files (checkerboards, RGB strips, a grid-tiled photo with EXIF/XMP, each with Apple's decode as `.ref.png`; a 10-bit RGBA file with its source PNG), for the `heif` feature | heic-rs (MIT OR Apache-2.0) and pillow-heif (BSD-3-Clause) upstreams | `xtask/heif-corpus.sha256` |
+| `corpus/exr/` | the 5 deep OpenEXR test images (scanline deep data with half colour and u32 ID channels; 2.3 MB), checked against the ID manifests of their upstream sidecars | OpenEXR upstream at v3.5.2 (BSD-3-Clause) | `xtask/exr-corpus.sha256` |
+| `corpus/pngsuite/` | PngSuite | schaik.com release archive (public domain) | (fixed archive) |
+
+```sh
+cargo xtask corpus                 # where each corpus lives, its pin, present or missing
+cargo xtask corpus --all           # fetch everything missing or stale (cold: about 15 s; verified copies are left alone)
+cargo xtask test-corpus            # fetch, then cargo test --release --features corpus (+ heif on codecs, io) on psd, codecs, io, engine
+cargo xtask test-corpus -p io      # narrow to one crate (repeat -p for more)
+cargo xtask test-corpus --changed  # only if psd, io, codecs, compose, gpu, text or format changed vs origin/main
+cargo xtask test-corpus -- --nocapture   # pass arguments to the test binaries (per-file tables)
+scripts/fetch-corpus.sh            # the same as cargo xtask corpus --all
+```
+
+**Opt-in locally, strict when opted in, always in CI.**
+
+- The corpus tests sit behind the `corpus` cargo feature of `photocraft-psd`, `photocraft-codecs`,
+  `photocraft-io` and `photocraft-engine`, so plain `cargo test` neither compiles nor needs them.
+  The HEIF ones also need the `heif` feature of `photocraft-codecs`/`photocraft-io` (test-corpus
+  turns it on).
+- With the feature on, a missing corpus is a failure ("run `cargo xtask corpus --all`"), never a
+  silent skip, and every floor is enforced.
+- If you touch psd, io, codecs, compose, gpu, text or format, run `cargo xtask test-corpus` before
+  you finish.
+- The CI `corpus` job runs `cargo xtask corpus --all` and then `cargo xtask test-corpus` on every PR
+  and on main. `corpus/` is cached with `actions/cache`, keyed on the hash of `corpus_pins.rs` and
+  the manifests. A download happens only when a pin changes; otherwise the cache restores in seconds
+  and is re-verified (sha256) before the tests run. Fork PRs read the base branch's cache.
+
+**Our own corpus: [photocraft-corpus](https://github.com/storytold/photocraft-corpus).**
+
+- **Authoring clone:** a normal git clone, `git clone git@github.com:storytold/photocraft-corpus.git`,
+  placed next to this checkout (`../photocraft-corpus`). Its generators write there, and you commit
+  and push there.
+- **Consuming copy:** `corpus/photoshop/` here. It is a plain directory: the pinned snapshot
+  (downloaded as the codeload tarball of the pinned commit, then verified).
+- **Local mode:** `cargo xtask corpus --photoshop --local` copies `photoshop/` from
+  `../photocraft-corpus` (or `PHOTOCRAFT_CORPUS_REPO=<path>`) instead of downloading. It warns when
+  the clone's HEAD isn't the pin or its files differ from the manifest. Use it to test regenerated
+  files before pushing: `cargo xtask test-corpus --local` copies them and runs every corpus test.
+- **Bumping the pin:** commit and push in photocraft-corpus, then in a PR here set
+  `PHOTOCRAFT_CORPUS_COMMIT` in `corpus_pins.rs`, run
+  `cargo xtask corpus --photoshop --update-manifest`, commit the manifest diff, run
+  `cargo xtask test-corpus`, and raise floors that improved.
+- **Not a submodule or a subtree:** a subtree would put the binaries back into this repository's
+  history, and submodules cause init and detached-HEAD friction for every contributor. A pin plus a
+  manifest gives the same reproducibility.
+- The third-party sets (psd-tools, ag-psd, PngSuite) are fetched from their upstreams the same way,
+  and are never copied into photocraft-corpus.
+
 ## Rendering fidelity (PSD oracle)
 
-`cargo test --release -p photocraft-io --test corpus -- --nocapture` compares our composite of every
-corpus PSD with Photoshop's own merged image (PASS ≤ 2/255). To dig into one file:
+`cargo xtask test-corpus -p io -- --nocapture` compares our composite of every corpus PSD with
+Photoshop's own merged image (PASS ≤ 2/255) and checks that export → re-import renders the same,
+per source with its own floors: `corpus/psd`, the psd-tools set (also a truncation/corruption sweep
+over every file that must never panic) and our Photoshop set `corpus/photoshop` (per-feature-group
+totals: `smart-filters`, `effects`, `text`, `adjustments/<mode><bits>`). Smart objects and type
+layers composite Photoshop's cached pixels there; `cargo xtask test-corpus -p engine -- --nocapture`
+(`crates/engine/tests/photoshop_oracles.rs`) re-renders them with our smart-filter stack and text
+engine and is the failure map for both. A panic is reported as `CRASH` and fails the run. Files without a real merged image (Maximize Compatibility off)
+are judged against their embedded thumbnail instead (`PASS (thumbnail)`, a strict low-resolution
+check); a file only SKIPs when it has no oracle at all. Raise the floors in `crates/io/tests/corpus.rs` when they
+improve; never lower them. Synthetic reproductions of corpus findings live in
+`crates/io/tests/corpus_regressions.rs` (corpus files are never committed). To dig into one file:
 
 ```sh
 cargo run --release -p photocraft-io --example oracle_diff -- corpus/psd/<file>.psd 0 png /tmp/diff.png

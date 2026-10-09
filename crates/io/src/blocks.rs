@@ -2,7 +2,7 @@
 //! smart objects, locks and label colors.
 
 use photocraft_color::{Color, ColorMode};
-use photocraft_doc::{BlendIf, BlendRange, Fill, GradientStyle, LabelColor, Locks};
+use photocraft_doc::{AdvancedBlending, BlendIf, BlendRange, Fill, GradientStyle, Knockout, LabelColor, Locks};
 use photocraft_geom::Affine;
 use photocraft_psd::descriptor::{Descriptor, Id, UnicodeString, Value, VersionedDescriptor};
 use photocraft_psd::layer::BlendingRanges;
@@ -16,6 +16,60 @@ pub fn parse_brst(data: &[u8]) -> u32 {
 /// Inverse of [`parse_brst`]; `None` when every channel blends (no block).
 pub fn brst_data(mask: u32) -> Option<Vec<u8>> {
     (mask != 0).then(|| (0..32u32).filter(|i| mask & 1 << i != 0).flat_map(u32::to_be_bytes).collect())
+}
+
+/// The Advanced Blending blocks, as (key, value for `a`, Photoshop's default value): `knko`
+/// (0 none, 1 shallow, 2 deep), `infx`, `clbl`, `tsly`, `lmgm`, `vmgm`. Each is stored as one
+/// byte followed by three bytes of padding (Adobe PSD spec, "Additional Layer Information").
+pub fn advanced_flags(a: &AdvancedBlending) -> [([u8; 4], u8, u8); 6] {
+    [
+        (*b"knko", a.knockout.to_psd(), 0),
+        (*b"infx", u8::from(a.blend_interior), 0),
+        (*b"clbl", u8::from(a.blend_clipped), 1),
+        (*b"tsly", u8::from(a.transparency_shapes), 1),
+        (*b"lmgm", u8::from(a.layer_mask_hides_effects), 0),
+        (*b"vmgm", u8::from(a.vector_mask_hides_effects), 0),
+    ]
+}
+
+/// Advanced Blending from a layer record's blocks (`block(key)` gives a block's data). A missing
+/// or empty block keeps Photoshop's default.
+pub fn advanced_from_blocks<'a>(block: impl Fn(&[u8; 4]) -> Option<&'a [u8]>) -> AdvancedBlending {
+    let mut a = AdvancedBlending::default();
+    let flag = |k: &[u8; 4]| block(k).and_then(|d| d.first().copied());
+    if let Some(v) = flag(b"knko") {
+        a.knockout = Knockout::from_psd(v);
+    }
+    let set = |k: &[u8; 4], f: &mut bool| {
+        if let Some(v) = flag(k) {
+            *f = v != 0;
+        }
+    };
+    set(b"infx", &mut a.blend_interior);
+    set(b"clbl", &mut a.blend_clipped);
+    set(b"tsly", &mut a.transparency_shapes);
+    set(b"lmgm", &mut a.layer_mask_hides_effects);
+    set(b"vmgm", &mut a.vector_mask_hides_effects);
+    a
+}
+
+/// Writes the Advanced Blending blocks into an exported layer's preserved block list: a block
+/// already there is rewritten in place (keeping Photoshop's block order); a missing one is added
+/// only when its value differs from the default, so plain layers gain no blocks.
+pub fn put_advanced(a: &AdvancedBlending, raw: &mut Vec<([u8; 4], Vec<u8>)>) {
+    for (key, v, default) in advanced_flags(a) {
+        match raw.iter_mut().find(|(k, _)| *k == key) {
+            Some(e) => {
+                // Keep any extra bytes a reader wrote; the flag is the first byte.
+                if e.1.len() < 4 {
+                    e.1.resize(4, 0);
+                }
+                e.1[0] = v;
+            }
+            None if v != default => raw.push((key, vec![v, 0, 0, 0])),
+            None => {}
+        }
+    }
 }
 
 /// Layer-record blending ranges (Adobe PSD spec, "Layer blending ranges data": the composite
@@ -46,15 +100,16 @@ pub fn ranges_from_blend_if(b: &BlendIf, channels: usize) -> BlendingRanges {
 }
 
 /// `lspf` bits (Adobe spec: bit 0 transparency, 1 composite, 2 position).
-/// Artboard (bit 3... here `0x10` as observed by ag-psd) and "all" (bit 31)
-/// are undocumented.
+/// Artboard (bit 3, `0x08`, as reference files write it) and "all" (bit 31) are undocumented.
+/// Older PhotoCraft builds wrote the artboard lock at bit 4 (`0x10`); that value is still
+/// accepted on read so those files keep their lock, and is rewritten at `0x08`.
 pub fn locks_from_lspf(v: u32) -> Locks {
-    Locks { transparency: v & 1 != 0, pixels: v & 2 != 0, position: v & 4 != 0, artboard: v & 0x10 != 0, all: v & 0x8000_0000 != 0 }
+    Locks { transparency: v & 1 != 0, pixels: v & 2 != 0, position: v & 4 != 0, artboard: v & 0x08 != 0 || v & 0x10 != 0, all: v & 0x8000_0000 != 0 }
 }
 
 /// Inverse of [`locks_from_lspf`].
 pub fn lspf_from_locks(l: &Locks) -> u32 {
-    u32::from(l.transparency) | u32::from(l.pixels) << 1 | u32::from(l.position) << 2 | u32::from(l.artboard) << 4 | u32::from(l.all) << 31
+    u32::from(l.transparency) | u32::from(l.pixels) << 1 | u32::from(l.position) << 2 | u32::from(l.artboard) << 3 | u32::from(l.all) << 31
 }
 
 /// `lclr` index → label.
@@ -67,6 +122,11 @@ pub fn label_from_index(v: u16) -> LabelColor {
         5 => LabelColor::Blue,
         6 => LabelColor::Violet,
         7 => LabelColor::Gray,
+        // Photoshop 2024 added these without renumbering the original labels.
+        8 => LabelColor::Seafoam,
+        9 => LabelColor::Indigo,
+        10 => LabelColor::Magenta,
+        11 => LabelColor::Fuchsia,
         _ => LabelColor::None,
     }
 }
@@ -82,6 +142,10 @@ pub fn label_index(l: LabelColor) -> u16 {
         LabelColor::Blue => 5,
         LabelColor::Violet => 6,
         LabelColor::Gray => 7,
+        LabelColor::Seafoam => 8,
+        LabelColor::Indigo => 9,
+        LabelColor::Magenta => 10,
+        LabelColor::Fuchsia => 11,
     }
 }
 
@@ -104,6 +168,8 @@ pub fn color_from_desc(d: &Descriptor) -> Option<Color> {
         b"RGBC" => Color::rgb(g("Rd  ")? / 255.0, g("Grn ")? / 255.0, g("Bl  ")? / 255.0),
         b"CMYC" => Color { mode: ColorMode::Cmyk, c: [g("Cyn ")? / 100.0, g("Mgnt")? / 100.0, g("Ylw ")? / 100.0, g("Blck")? / 100.0], alpha: 1.0 },
         b"Grsc" => Color::gray(1.0 - g("Gry ")? / 100.0),
+        // CIE L*a*b*: L 0..100, a / b −128..127 (stored like Lab pixels: offset by 128).
+        b"LbCl" => Color { mode: ColorMode::Lab, c: [g("Lmnc")? / 100.0, (g("A   ")? + 128.0) / 255.0, (g("B   ")? + 128.0) / 255.0, 0.0], alpha: 1.0 },
         // Newer Photoshop writes 0..1 floats.
         _ if d.get("redFloat").is_some() => Color::rgb(g("redFloat")?, g("greenFloat")?, g("blueFloat")?),
         _ => {
@@ -123,6 +189,9 @@ pub fn color_to_desc(c: &Color) -> Descriptor {
             .with("Ylw ", d(c.c[2] * 100.0))
             .with("Blck", d(c.c[3] * 100.0)),
         ColorMode::Grayscale => Descriptor::new("Grsc").with("Gry ", d((1.0 - c.c[0]) * 100.0)),
+        ColorMode::Lab => {
+            Descriptor::new("LbCl").with("Lmnc", d(c.c[0] * 100.0)).with("A   ", d(c.c[1] * 255.0 - 128.0)).with("B   ", d(c.c[2] * 255.0 - 128.0))
+        }
         _ => {
             let rgb = c.to_rgb();
             Descriptor::new("RGBC").with("Rd  ", d(rgb[0] * 255.0)).with("Grn ", d(rgb[1] * 255.0)).with("Bl  ", d(rgb[2] * 255.0))
@@ -178,6 +247,47 @@ pub(crate) type Stops = (Vec<(f32, Color)>, Vec<(f32, f32)>);
 /// Stops of a `Grdn` descriptor, baked to Photoshop's interpolation (smoothness `Intr`, stop
 /// midpoints, and the parent's `gs99` interpolation method when given).
 pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> Stops {
+    let raw = gradient_stops_raw(grad);
+    let stops = if raw.stops.len() >= 2 {
+        crate::gradient_bake::bake(raw.stops, &raw.mids, raw.smooth, crate::gradient_bake::Method::from_code(method))
+    } else {
+        raw.stops
+    };
+    (stops, raw.opacity)
+}
+
+/// A `Grdn` descriptor's stops as stored: colour stops (sorted), the midpoint of each segment
+/// between them, opacity stops and the smoothness (`Intr`, `0..=1`).
+pub(crate) struct RawStops {
+    pub stops: Vec<(f32, Color)>,
+    pub mids: Vec<f32>,
+    pub opacity: Vec<(f32, f32)>,
+    pub smooth: f32,
+}
+
+/// Stops of a gradient fill layer, kept editable: when Photoshop's interpolation is plain
+/// (no smoothness, Classic method) the stops stay as they are with their midpoints, else they
+/// are baked like [`gradient_stops_with`] (midpoints folded in). Opacity stops that are all
+/// 100 % come back empty.
+pub(crate) fn gradient_stops_editable(grad: &Descriptor, method: Option<&[u8]>) -> RawStops {
+    let mut raw = gradient_stops_raw(grad);
+    let m = crate::gradient_bake::Method::from_code(method);
+    // Lab stops (Lab documents) interpolate in L*a*b*, which only baking reproduces.
+    let lab = raw.stops.iter().all(|(_, c)| c.mode == photocraft_color::ColorMode::Lab);
+    if raw.stops.len() >= 2 && (raw.smooth > 0.0 || m != crate::gradient_bake::Method::Classic || lab) {
+        raw.stops = crate::gradient_bake::bake(std::mem::take(&mut raw.stops), &raw.mids, raw.smooth, m);
+        raw.mids.clear();
+    }
+    if raw.mids.iter().all(|m| (m - 0.5).abs() < 1e-3) {
+        raw.mids.clear();
+    }
+    if raw.opacity.iter().all(|o| (o.1 - 1.0).abs() < 1e-4) {
+        raw.opacity.clear();
+    }
+    raw
+}
+
+fn gradient_stops_raw(grad: &Descriptor) -> RawStops {
     let mut stops = Vec::new();
     let mut mids = Vec::new();
     let mut opacity = Vec::new();
@@ -195,9 +305,12 @@ pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> S
     // Midpoint k applies to the segment after stop k.
     let mut order: Vec<usize> = (0..stops.len()).collect();
     order.sort_by(|a, b| stops[*a].0.total_cmp(&stops[*b].0));
-    let mids: Vec<f32> = order.iter().skip(1).map(|i| mids[*i]).collect();
+    let mids: Vec<f32> = order.iter().skip(1).map(|i| mids.get(*i).copied().unwrap_or(0.5)).collect();
     let smooth = num(grad.get("Intr")).map_or(0.0, |v| (v / 4096.0) as f32);
-    let stops = if stops.len() >= 2 { crate::gradient_bake::bake(stops, &mids, smooth, crate::gradient_bake::Method::from_code(method)) } else { stops };
+    let mut sorted: Vec<(f32, Color)> = order.iter().filter_map(|i| stops.get(*i).cloned()).collect();
+    if sorted.len() != stops.len() {
+        sorted = stops;
+    }
     if let Some(Value::List(items)) = grad.get("Trns") {
         for it in items {
             if let Value::Descriptor(s) = it {
@@ -206,20 +319,32 @@ pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> S
             }
         }
     }
-    (stops, opacity)
+    RawStops { stops: sorted, mids, opacity, smooth }
 }
 
 /// A `Grdn` descriptor for colour and opacity stops.
 pub(crate) fn gradient_desc(stops: &[(f32, Color)], opacity: &[(f32, f32)]) -> Descriptor {
+    gradient_desc_with(stops, opacity, &[])
+}
+
+/// [`gradient_desc`] with colour midpoints (one per segment between the sorted stops; each is
+/// stored on the stop that ends its segment, as [`gradient_stops_with`] reads it).
+pub(crate) fn gradient_desc_with(stops: &[(f32, Color)], opacity: &[(f32, f32)], mids: &[f32]) -> Descriptor {
+    let mut stops = stops.to_vec();
+    if !mids.is_empty() {
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
     let clrs = stops
         .iter()
-        .map(|(t, c)| {
+        .enumerate()
+        .map(|(i, (t, c))| {
+            let mid = i.checked_sub(1).and_then(|k| mids.get(k)).copied().unwrap_or(0.5);
             Value::Descriptor(
                 Descriptor::new("Clrt")
                     .with("Clr ", Value::Descriptor(color_to_desc(c)))
                     .with("Type", Value::Enumerated { type_id: Id::new("Clry"), value: Id::new("UsrS") })
                     .with("Lctn", Value::Integer((t * 4096.0).round() as i32))
-                    .with("Mdpn", Value::Integer(50)),
+                    .with("Mdpn", Value::Integer((mid.clamp(0.05, 0.95) * 100.0).round() as i32)),
             )
         })
         .collect();
@@ -244,6 +369,28 @@ pub(crate) fn gradient_desc(stops: &[(f32, Color)], opacity: &[(f32, f32)]) -> D
         .with("Trns", Value::List(trns))
 }
 
+/// Opacity stops of a `Grdn` descriptor with Photoshop's smoothness and midpoints applied (the
+/// same curve as the colour stops, Classic interpolation), densely sampled.
+fn smoothed_opacity_stops(grad: &Descriptor) -> Vec<(f32, f32)> {
+    let mut stops = Vec::new();
+    let mut mids = Vec::new();
+    if let Some(Value::List(items)) = grad.get("Trns") {
+        for it in items {
+            if let Value::Descriptor(s) = it {
+                let a = num(s.get("Opct")).unwrap_or(100.0) as f32 / 100.0;
+                stops.push((num(s.get("Lctn")).unwrap_or(0.0) as f32 / 4096.0, Color::rgba(a, a, a, 1.0)));
+                mids.push(num(s.get("Mdpn")).unwrap_or(50.0) as f32 / 100.0);
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..stops.len()).collect();
+    order.sort_by(|a, b| stops[*a].0.total_cmp(&stops[*b].0));
+    let mids: Vec<f32> = order.iter().skip(1).filter_map(|i| mids.get(*i).copied()).collect();
+    let smooth = num(grad.get("Intr")).map_or(0.0, |v| (v / 4096.0) as f32);
+    let baked = if stops.len() >= 2 { crate::gradient_bake::bake(stops, &mids, smooth, crate::gradient_bake::Method::Classic) } else { stops };
+    baked.into_iter().map(|(t, c)| (t, c.to_rgb()[0])).collect()
+}
+
 /// Parses a fill block (`SoCo`, `GdFl`, `PtFl`).
 pub fn parse_fill(key: &[u8; 4], data: &[u8]) -> Option<Fill> {
     // Block data may carry trailing padding after the descriptor.
@@ -259,11 +406,31 @@ pub fn fill_from_desc(key: &[u8; 4], d: &Descriptor) -> Option<Fill> {
         b"GdFl" => {
             let angle = num(d.get("Angl")).unwrap_or(90.0) as f32;
             let scale = num(d.get("Scl ")).map_or(1.0, |v| v as f32 / 100.0);
-            let (mut stops, _) = get_desc(d, "Grad").map(|g| gradient_stops_with(g, enum_of(d, "gs99"))).unwrap_or_default();
+            let raw = get_desc(d, "Grad").map(|g| gradient_stops_editable(g, enum_of(d, "gs99")));
+            let (mut stops, midpoints) = raw.map(|r| (r.stops, r.mids)).unwrap_or_default();
+            // Opacity stops with Photoshop's smoothness and opacity midpoints applied (raw when
+            // the interpolation is plain); none when fully opaque.
+            let mut opacity_stops = get_desc(d, "Grad").map(smoothed_opacity_stops).unwrap_or_default();
+            if opacity_stops.iter().all(|o| o.1 >= 1.0 - 1e-4) {
+                opacity_stops.clear();
+            }
             if stops.is_empty() {
                 stops = vec![(0.0, Color::BLACK), (1.0, Color::WHITE)];
             }
-            Some(Fill::Gradient { stops, angle, scale, style: gradient_style(d), reverse: bool_of(d, "Rvrs") })
+            let pct = |o: &Descriptor, k: &str| num(o.get(k)).map_or(0.0, |v| v as f32 / 100.0);
+            let offset = get_desc(d, "Ofst").map_or((0.0, 0.0), |o| (pct(o, "Hrzn"), pct(o, "Vrtc")));
+            Some(Fill::Gradient {
+                stops,
+                angle,
+                scale,
+                style: gradient_style(d),
+                reverse: bool_of(d, "Rvrs"),
+                opacity_stops,
+                midpoints,
+                offset,
+                dither: bool_of(d, "Dthr"),
+                align: !matches!(d.get("Algn"), Some(Value::Boolean(false))),
+            })
         }
         b"PtFl" => {
             let (name, id) = pattern_ref(d);
@@ -285,14 +452,24 @@ pub fn write_fill(f: &Fill) -> ([u8; 4], Vec<u8>) {
 pub fn fill_to_desc(f: &Fill) -> ([u8; 4], Descriptor) {
     match f {
         Fill::Solid(c) => (*b"SoCo", Descriptor::new("null").with("Clr ", Value::Descriptor(color_to_desc(c)))),
-        Fill::Gradient { stops, angle, scale, style, reverse } => {
+        Fill::Gradient { stops, angle, scale, style, reverse, opacity_stops, midpoints, offset, dither, align } => {
+            let prc = |v: f32| Value::UnitFloat { unit: *b"#Prc", value: f64::from(v * 100.0) };
             let mut d = Descriptor::new("null")
                 .with("Angl", Value::UnitFloat { unit: *b"#Ang", value: f64::from(*angle) })
                 .with("Type", gradient_style_value(*style))
-                .with("Scl ", Value::UnitFloat { unit: *b"#Prc", value: f64::from(scale * 100.0) })
-                .with("Grad", Value::Descriptor(gradient_desc(stops, &[])));
+                .with("Scl ", prc(*scale))
+                .with("Grad", Value::Descriptor(gradient_desc_with(stops, opacity_stops, midpoints)));
             if *reverse {
                 d = d.with("Rvrs", Value::Boolean(true));
+            }
+            if *dither {
+                d = d.with("Dthr", Value::Boolean(true));
+            }
+            if !*align {
+                d = d.with("Algn", Value::Boolean(false));
+            }
+            if *offset != (0.0, 0.0) {
+                d = d.with("Ofst", Value::Descriptor(Descriptor::new("Pnt ").with("Hrzn", prc(offset.0)).with("Vrtc", prc(offset.1))));
             }
             (*b"GdFl", d)
         }
@@ -418,6 +595,31 @@ pub fn parse_smart(key: &[u8; 4], data: &[u8]) -> (String, Affine) {
     (id, affine)
 }
 
+/// The projective placement of a `SoLd` / `SoLE` block whose corners aren't a parallelogram
+/// (Distort, Perspective): source pixels → document pixels, row-major 3×3. Read from
+/// `nonAffineTransform` (the placed corners), else `Trnf`. `None` for affine placements, which
+/// [`parse_smart`]'s affine holds exactly.
+pub fn parse_smart_perspective(key: &[u8; 4], data: &[u8]) -> Option<[f64; 9]> {
+    if key != b"SoLd" && key != b"SoLE" {
+        return None;
+    }
+    let d = data.get(8..).and_then(parse_prefix_versioned)?;
+    let sz = get_desc(&d, "Sz  ")?;
+    let (w, h) = (num(sz.get("Wdth"))?, num(sz.get("Hght"))?);
+    let quad = |key: &str| -> Option<[[f64; 2]; 4]> {
+        let Some(Value::List(pts)) = d.get(key) else { return None };
+        let p: Vec<f64> = pts.iter().filter_map(|v| num(Some(v))).collect();
+        (p.len() == 8 && p.iter().all(|v| v.is_finite())).then(|| [[p[0], p[1]], [p[2], p[3]], [p[4], p[5]], [p[6], p[7]]])
+    };
+    let q = quad("nonAffineTransform").or_else(|| quad("Trnf"))?;
+    // A parallelogram (top-left + bottom-right = top-right + bottom-left) is affine.
+    let tol = 1e-6 * (1.0 + q.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs())));
+    if (0..2).all(|i| (q[0][i] + q[2][i] - q[1][i] - q[3][i]).abs() <= tol) || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    photocraft_algo::transform::Homography::rect_to_quad([0.0, 0.0, w, h], q).map(|m| m.0)
+}
+
 /// `masterFXSwitch` from an `lfx2` block (defaults to `true`).
 pub fn effects_enabled(lfx2: &[u8]) -> bool {
     lfx2.get(4..)
@@ -431,6 +633,46 @@ pub fn effects_enabled(lfx2: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// psd-tools layers-minimal/gradient-fill.psd ("Color to Transparent", no stored pixels): a
+    /// gradient fill's opacity stops reach the model (as its opacity stops; written from stop
+    /// alpha) and survive a write; the ramp's alpha follows them.
+    #[test]
+    fn gradient_fill_opacity_stops_become_alpha() {
+        use photocraft_color::Color;
+        use photocraft_doc::{Fill, GradientStyle};
+        let red = Color::rgba(1.0, 0.0, 0.0, 1.0);
+        let f = Fill::gradient(vec![(0.0, red), (1.0, Color { alpha: 0.0, ..red })], 90.0, 1.0, GradientStyle::Linear, false);
+        let (k, data) = super::write_fill(&f);
+        let back = super::parse_fill(&k, &data).unwrap();
+        let Fill::Gradient { stops, opacity_stops, .. } = &back else { panic!("gradient") };
+        assert_eq!(opacity_stops, &vec![(0.0, 1.0), (1.0, 0.0)]);
+        assert!(stops.iter().all(|s| s.1.c[0] == 1.0 && s.1.c[1] == 0.0));
+        let ramp = photocraft_compose::gradient_fill::Ramp::new(&back).unwrap();
+        assert_eq!(ramp.sample(0.0)[3], 1.0);
+        assert!(ramp.sample(1.0)[3] < 0.01);
+        // Opaque gradients come back without opacity stops.
+        let (k, data) = super::write_fill(&Fill::gradient(vec![(0.0, red), (1.0, Color::WHITE)], 0.0, 1.0, GradientStyle::Linear, false));
+        let Some(Fill::Gradient { opacity_stops, .. }) = super::parse_fill(&k, &data) else { panic!("gradient") };
+        assert!(opacity_stops.is_empty());
+    }
+
+    #[test]
+    fn lab_descriptor_colours_round_trip() {
+        use photocraft_color::ColorMode;
+        use photocraft_psd::descriptor::{Descriptor, Value};
+        let d = Descriptor::new("LbCl").with("Lmnc", Value::Double(19.07)).with("A   ", Value::Double(52.29)).with("B   ", Value::Double(-85.08));
+        let c = super::color_from_desc(&d).unwrap();
+        assert_eq!(c.mode, ColorMode::Lab);
+        assert!((c.c[0] - 0.1907).abs() < 1e-5 && (c.c[1] * 255.0 - 128.0 - 52.29).abs() < 1e-3 && (c.c[2] * 255.0 - 128.0 + 85.08).abs() < 1e-3);
+        let back = super::color_from_desc(&super::color_to_desc(&c)).unwrap();
+        assert_eq!(back.mode, ColorMode::Lab);
+        for i in 0..3 {
+            assert!((back.c[i] - c.c[i]).abs() < 1e-6);
+        }
+        // Missing components are rejected, not defaulted.
+        assert!(super::color_from_desc(&Descriptor::new("LbCl").with("Lmnc", Value::Double(50.0))).is_none());
+    }
+
     #[test]
     fn blending_ranges_map_to_blend_if() {
         use photocraft_doc::{BlendIf, BlendRange};
@@ -456,6 +698,37 @@ mod tests {
         assert_eq!(r.data.len(), 4 * 8);
         assert_eq!(&r.data[..8], &[5, 5, 255, 255, 0, 0, 255, 255]);
         assert_eq!(&r.data[8..], &BlendingRanges::full(2).data[..]);
+    }
+
+    #[test]
+    fn advanced_blending_blocks_round_trip() {
+        use photocraft_doc::{AdvancedBlending, Knockout};
+        let a = AdvancedBlending {
+            knockout: Knockout::Deep,
+            blend_interior: true,
+            blend_clipped: false,
+            transparency_shapes: false,
+            layer_mask_hides_effects: true,
+            vector_mask_hides_effects: true,
+        };
+        let mut raw = Vec::new();
+        super::put_advanced(&a, &mut raw);
+        assert_eq!(raw.len(), 6);
+        assert!(raw.contains(&(*b"knko", vec![2, 0, 0, 0])));
+        assert!(raw.contains(&(*b"clbl", vec![0, 0, 0, 0])));
+        let get = |k: &[u8; 4]| raw.iter().find(|(bk, _)| bk == k).map(|(_, d)| d.as_slice());
+        assert_eq!(super::advanced_from_blocks(get), a);
+        // Defaults: nothing added to a plain layer; existing blocks rewritten in place, in order.
+        let mut plain = Vec::new();
+        super::put_advanced(&AdvancedBlending::default(), &mut plain);
+        assert!(plain.is_empty());
+        let mut kept = vec![(*b"luni", vec![0; 4]), (*b"knko", vec![1, 0, 0, 0]), (*b"clbl", vec![1])];
+        super::put_advanced(&AdvancedBlending::default(), &mut kept);
+        assert_eq!(kept, vec![(*b"luni", vec![0; 4]), (*b"knko", vec![0, 0, 0, 0]), (*b"clbl", vec![1, 0, 0, 0])]);
+        // Missing and empty blocks read as Photoshop's defaults.
+        assert!(super::advanced_from_blocks(|_| None).is_default());
+        assert!(super::advanced_from_blocks(|_| Some(&[][..])).is_default());
+        assert_eq!(super::advanced_from_blocks(|k| (k == b"knko").then_some(&[1u8][..])).knockout, Knockout::Shallow);
     }
 
     #[test]
@@ -515,9 +788,15 @@ mod tests {
 
     #[test]
     fn locks_and_labels() {
-        for bits in [0u32, 1, 2, 4, 0x10, 0x8000_0000, 0x8000_0017] {
+        // Reference values round-trip byte for byte; Background layers carry 0x0D
+        // (transparency + position + the bit-3 lock reference files write).
+        for bits in [0u32, 1, 2, 4, 8, 0x0D, 0x8000_0000, 0x8000_000F] {
             assert_eq!(lspf_from_locks(&locks_from_lspf(bits)), bits);
         }
+        // Older PhotoCraft files wrote the artboard lock at 0x10; it reads back as artboard
+        // and is rewritten at the reference value 0x08.
+        assert!(locks_from_lspf(0x10).artboard);
+        assert_eq!(lspf_from_locks(&locks_from_lspf(0x10)), 0x08);
         for i in 0..8 {
             assert_eq!(label_index(label_from_index(i)), i);
         }
@@ -529,12 +808,19 @@ mod tests {
             Fill::Solid(Color::rgb(1.0, 0.5, 0.0)),
             Fill::Solid(Color { mode: ColorMode::Cmyk, c: [0.1, 0.2, 0.3, 0.4], alpha: 1.0 }),
             Fill::Solid(Color::gray(0.25)),
+            Fill::gradient(vec![(0.0, Color::rgb(1.0, 0.0, 0.0)), (1.0, Color::rgb(0.0, 0.0, 1.0))], 45.0, 1.0, GradientStyle::Reflected, true),
+            // A live gradient (Gradient tool): canvas-aligned, offset, midpoints, opacity, dither.
             Fill::Gradient {
-                stops: vec![(0.0, Color::rgb(1.0, 0.0, 0.0)), (1.0, Color::rgb(0.0, 0.0, 1.0))],
-                angle: 45.0,
-                scale: 1.0,
-                style: GradientStyle::Reflected,
-                reverse: true,
+                stops: vec![(0.0, Color::rgb(1.0, 0.0, 0.0)), (0.5, Color::rgb(0.0, 1.0, 0.0)), (1.0, Color::rgb(0.0, 0.0, 1.0))],
+                angle: -33.5,
+                scale: 2.25,
+                style: GradientStyle::Radial,
+                reverse: false,
+                opacity_stops: vec![(0.0, 1.0), (0.25, 0.5), (1.0, 0.0)],
+                midpoints: vec![0.25, 0.75],
+                offset: (0.125, -0.375),
+                dither: true,
+                align: false,
             },
             Fill::Pattern { name: "Bubbles".into(), scale: 0.5, id: "abc".into(), angle: 30.0, link: false, phase: (3.0, -2.0) },
         ] {

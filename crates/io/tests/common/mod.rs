@@ -89,6 +89,9 @@ pub fn gen_doc(mode: ColorMode, depth: SampleType, f: Features) -> Document {
     neg.fill_opacity = g(128);
     neg.blend = BlendMode::Multiply;
     neg.label = LabelColor::Blue;
+    // Advanced Blending switches round-trip as `infx` / `tsly` (and the rest below).
+    neg.advanced.blend_interior = true;
+    neg.advanced.transparency_shapes = false;
     d.layers.push(neg);
 
     let mut hidden = raster("Hidden", fmt, Rect::new(3, 3, 9, 9), 3, true);
@@ -105,6 +108,8 @@ pub fn gen_doc(mode: ColorMode, depth: SampleType, f: Features) -> Document {
     if f.masks {
         let mut m = raster("Masked", fmt, Rect::new(2, 2, 14, 12), 5, true);
         m.mask = Some(LayerMask { surface: mask_surface(depth, Rect::new(4, 4, 10, 9), 1.0, 1), enabled: true, linked: true, density: 1.0, feather: 0.0 });
+        m.advanced.layer_mask_hides_effects = true;
+        m.advanced.vector_mask_hides_effects = true;
         d.layers.push(m);
         let mut m2 = raster("Masked2", fmt, Rect::new(-2, 1, 6, 5), 6, true);
         m2.mask =
@@ -120,10 +125,13 @@ pub fn gen_doc(mode: ColorMode, depth: SampleType, f: Features) -> Document {
         if let LayerContent::Group(gr) = &mut inner.content {
             gr.expanded = false;
         }
+        inner.advanced.knockout = photocraft_doc::Knockout::Shallow;
         let a = raster("Outer child", fmt, Rect::new(6, 2, 12, 8), 8, true);
         let mut outer = Layer::group("Outer", vec![a, inner]);
         outer.locks.position = true;
         outer.label = LabelColor::Red;
+        outer.advanced.knockout = photocraft_doc::Knockout::Deep;
+        outer.advanced.blend_clipped = false;
         d.layers.push(outer);
         d.layers.push(Layer::group("Empty group", vec![]));
     }
@@ -235,6 +243,9 @@ pub fn assert_layers_eq(a: &Layer, b: &Layer, path: &str) {
     assert_eq!(a.fill_opacity, b.fill_opacity, "{ctx}: fill");
     assert_eq!(a.clipped, b.clipped, "{ctx}: clipped");
     assert_eq!(a.label, b.label, "{ctx}: label");
+    assert_eq!(a.advanced, b.advanced, "{ctx}: advanced blending");
+    assert_eq!(a.excluded_channels, b.excluded_channels, "{ctx}: channel restrictions");
+    assert_eq!(a.blend_if, b.blend_if, "{ctx}: blend if");
     assert_eq!(a.effects.psd_raw, b.effects.psd_raw, "{ctx}: effects raw");
     assert_eq!(a.effects.enabled, b.effects.enabled, "{ctx}: effects enabled");
     if a.psd_id.is_some() {
@@ -326,4 +337,54 @@ fn tone_space(mode: ColorMode) -> photocraft_doc::adjust::ToneSpace {
         ColorMode::Lab => photocraft_doc::adjust::ToneSpace::Lab,
         _ => photocraft_doc::adjust::ToneSpace::Rgb,
     }
+}
+
+/// Strict structural check of a written PSD/PSB (#200): every tagged block must
+/// re-parse with its section sizes matching, laid out as Photoshop writes it so
+/// that readers which step from block to block by length (psd-tools) stay
+/// aligned. Returns one message per problem; empty means clean.
+///
+/// - the file parses, with no unparsed bytes left in the layer and mask section;
+/// - the layer info body is padded to a multiple of 4;
+/// - global (document-level) blocks are padded to a multiple of 4;
+/// - layer blocks have an even length with no pad byte outside it;
+/// - blocks with inner lengths (`PlLd`, `SoLd`, `SoLE`, `lnk2`/`lnk3`/`lnkD`, `lfx2`)
+///   re-parse exactly (`TaggedBlock::check_structure`).
+pub fn strict_block_errors(bytes: &[u8]) -> Vec<String> {
+    let file = match photocraft_psd::PsdFile::from_bytes(bytes) {
+        Ok(f) => f,
+        Err(e) => return vec![format!("parse: {e}")],
+    };
+    let v = file.header.version;
+    let mut errs = Vec::new();
+    if !file.layer_mask_trailing.is_empty() {
+        errs.push(format!("{} unparsed bytes at the end of the layer and mask section", file.layer_mask_trailing.len()));
+    }
+    if let Some(li) = &file.layer_info {
+        let body = li.unpadded_len(v).unwrap_or(1);
+        let pad = li.padding.as_ref().map_or(body % 2, |p| p.len() as u64);
+        if (body + pad) % 4 != 0 {
+            errs.push(format!("layer info: {body} bytes + {pad} padding is not a multiple of 4"));
+        }
+    }
+    for b in &file.global_blocks {
+        let pad = b.padding.as_ref().map_or(b.data.len() % 2, Vec::len);
+        if (b.data.len() + pad) % 4 != 0 {
+            errs.push(format!("global {}: {} data bytes + {pad} padding is not a multiple of 4", b.key_str(), b.data.len()));
+        }
+        if let Err(e) = b.check_structure() {
+            errs.push(format!("global {}: {e}", b.key_str()));
+        }
+    }
+    for (i, l) in file.layers().iter().enumerate() {
+        for b in &l.blocks {
+            if b.data.len() % 2 != 0 || b.padding.as_ref().is_some_and(|p| !p.is_empty()) {
+                errs.push(format!("layer {i} {}: {} data bytes with padding outside the length", b.key_str(), b.data.len()));
+            }
+            if let Err(e) = b.check_structure() {
+                errs.push(format!("layer {i} {}: {e}", b.key_str()));
+            }
+        }
+    }
+    errs
 }

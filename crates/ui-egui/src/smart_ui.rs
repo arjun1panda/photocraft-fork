@@ -20,10 +20,16 @@ pub fn thumb_badge(ui: &egui::Ui, l: &Layer, thumb: Rect) {
     icons::paint(ui, r, "app-window", 9.0, t.icon);
 }
 
-/// The display name of a smart filter (its command's label without the ellipsis).
-fn filter_label(command: &str) -> String {
+/// The display name of a smart filter (its command's label without the ellipsis). A Photoshop
+/// filter PhotoCraft doesn't implement shows its own name and is marked as kept as is.
+fn filter_label(f: &photocraft_doc::SmartFilter) -> String {
+    let command = f.command.as_str();
+    if command == photocraft_engine::smart_cmds::UNSUPPORTED_FILTER {
+        let name = f.params.get("name").and_then(Value::as_str).unwrap_or("Photoshop filter");
+        return format!("{} (kept, not editable)", name.trim_end_matches("...").trim_end_matches('…'));
+    }
     photocraft_engine::commands::find(command)
-        .map_or_else(|| command.rsplit('.').next().unwrap_or(command).to_string(), |c| c.label.trim_end_matches('…').to_string())
+        .map_or_else(|| command.rsplit('.').next().unwrap_or(command).to_string(), |c| tl!(c.label).trim_end_matches('…').to_string())
 }
 
 /// Smart Filters header + one row per filter (top filter first, as in Photoshop) under a smart
@@ -46,7 +52,7 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth:
         }
         let (name, on) = match index {
             None => ("Smart Filters".to_string(), sm.filters_enabled),
-            Some(i) => (filter_label(&sm.smart_filters[i].command), sm.smart_filters[i].visible && sm.filters_enabled),
+            Some(i) => (filter_label(&sm.smart_filters[i]), sm.smart_filters[i].visible && sm.filters_enabled),
         };
         let eye = Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 9.0), vec2(18.0, 18.0));
         let eye_resp = ui.interact(eye, ui.id().with(("sf-eye", l.id.0, index)), Sense::click());
@@ -54,7 +60,9 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth:
             None => sm.filters_enabled,
             Some(i) => sm.smart_filters[i].visible,
         };
-        icons::paint(ui, eye, if shown { "eye" } else { "eye-off" }, 12.0, if shown { t.icon } else { t.text_faint });
+        if shown {
+            icons::paint(ui, eye, "eye", 12.0, t.icon);
+        }
         if eye_resp.clicked() {
             actions.push(match index {
                 None => ("layer.smartFilter.disableSmartFilters".into(), json!({"layer": l.id.0})),
@@ -71,15 +79,23 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth:
         if let Some(i) = index
             && resp.double_clicked()
         {
-            open_editor(app, l.id.0, sm, i);
+            open_editor(app, ui.ctx(), l.id.0, sm, i);
         }
     }
 }
 
 /// Re-opens a smart filter's dialog with its recorded parameters; OK runs
 /// `layer.smartFilter.setParams` instead of adding another filter (see `dialogs::confirm`).
-pub fn open_editor(app: &mut PhotocraftApp, layer: u64, sm: &SmartObject, index: usize) {
+pub fn open_editor(app: &mut PhotocraftApp, ctx: &egui::Context, layer: u64, sm: &SmartObject, index: usize) {
     let Some(f) = sm.smart_filters.get(index) else { return };
+    // Camera Raw has its own full-window dialog rather than a generic parameter form.
+    if f.command == photocraft_engine::lens_cmds::RAW {
+        if let Err(e) = crate::camera_raw_ui::open_smart_filter(app, ctx, photocraft_doc::LayerId(layer), index) {
+            app.ui.status = e;
+            app.ui.status_error = true;
+        }
+        return;
+    }
     if !crate::filter_dialog::has_dialog(&f.command) {
         return;
     }

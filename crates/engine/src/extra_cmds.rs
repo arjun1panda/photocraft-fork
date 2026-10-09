@@ -1,7 +1,8 @@
 //! Everyday Photoshop commands that build on the core ones: Edit › Stroke, the fixed Transform
 //! presets (Rotate 180°/90°, Flip), Paste Into, Reselect, Equalize, Reveal All, Layer from
 //! Background, Copy/Paste Layer Style, Hide All Effects, layer-mask toggles, Rasterize variants,
-//! Delete Hidden / Empty Layers, Ungroup, Hide/Show Layers, Average and Clouds.
+//! Delete Hidden / Empty Layers, Ungroup, Hide/Show Layers, Show Only This Layer (⌥-click an eye),
+//! Average and Clouds.
 
 use photocraft_algo::selection as sel;
 use photocraft_doc::{Document, Layer, LayerContent, LayerId, LayerMask};
@@ -28,7 +29,7 @@ fn has_layer(s: &Session) -> std::result::Result<(), String> {
 fn has_pixels(s: &Session) -> std::result::Result<(), String> {
     match active_layer(s)?.content {
         LayerContent::Raster(_) => Ok(()),
-        ref c => Err(format!("active layer is a {} layer, not a pixel layer", c.kind_name())),
+        ref c => Err(format!("active layer is {} {} layer, not a pixel layer", c.article(), c.kind_name())),
     }
 }
 
@@ -42,7 +43,7 @@ fn has_clip_and_selection(s: &Session) -> std::result::Result<(), String> {
     d.doc.selection.as_ref().map(|_| ()).ok_or_else(|| "Paste Into needs a selection".into())
 }
 
-fn is_background(l: &Layer) -> bool {
+pub(crate) fn is_background(l: &Layer) -> bool {
     l.name == "Background" && l.locks.transparency && l.locks.position && matches!(l.content, LayerContent::Raster(_))
 }
 
@@ -67,11 +68,12 @@ fn map_pixels(s: &mut Session, label: &str, f: impl FnOnce(Rect, &mut [[f32; 4]]
         let canvas = doc.bounds();
         let selection = doc.selection.clone();
         let area = selection.as_ref().map_or(canvas, |m| m.content_bounds().intersect(&canvas));
+        let locks = doc.effective_locks(id);
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        if l.locks.pixels || l.locks.all {
+        if locks.pixels || locks.all {
             return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", l.name)));
         }
-        let lock_alpha = l.locks.transparency;
+        let lock_alpha = locks.transparency;
         let surf = l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))?;
         if area.is_empty() {
             return Ok(());
@@ -138,9 +140,8 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let band: Vec<f32> = outer.iter().zip(&inner).map(|(o, i)| (o - i).clamp(0.0, 1.0)).collect();
         let band = sel::mask_to_surface(&band, canvas);
-        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        let lock = l.locks.transparency;
-        let surf = crate::commands::paint_surface(l, &Value::Null)?;
+        let lock = doc.effective_locks(id).transparency;
+        let surf = crate::commands::paint_surface(doc, id, &Value::Null)?;
         let area = band.content_bounds().intersect(&canvas);
         if !area.is_empty() {
             crate::pixels::fill_surface(surf, area, color, Some(&band), lock);
@@ -297,30 +298,39 @@ fn can_reselect(s: &Session) -> std::result::Result<(), String> {
 fn paste_into(s: &mut Session, p: &Value, outside: bool) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let selection = d.doc.selection.clone().ok_or(EngineError::Other("Paste Into needs a selection".into()))?;
+    let canvas = d.doc.bounds();
     let b = selection.content_bounds();
-    let key = step_key(s, "pasteInto");
-    let mut params = json!({"center": [(b.x0 + b.x1) as f64 / 2.0, (b.y0 + b.y1) as f64 / 2.0], "coalesce": key});
+    // Where the paste shows: the selection, or everything but it (default reveal, the
+    // selection's area inverted).
+    let limit = if outside {
+        let area = b.intersect(&canvas);
+        let inv: Vec<f32> = sel::mask_from_surface(Some(&selection), area).iter().map(|v| 1.0 - v).collect();
+        let mut m = photocraft_raster::Surface::with_default(photocraft_color::PixelFormat::GRAY8, &[1.0]);
+        m.write_region(area, &inv);
+        m
+    } else {
+        selection
+    };
+    let label = if outside { "Paste Outside" } else { "Paste Into" };
+    let mut params = json!({"center": [(b.x0 + b.x1) as f64 / 2.0, (b.y0 + b.y1) as f64 / 2.0]});
     if let Some(c) = p.get("center") {
         params["center"] = c.clone();
     }
+    if crate::channel_cmds::target_of(p) != crate::channel_cmds::Target::Pixels {
+        // A targeted mask or channel (#1035): the paste goes into it, only where `limit` allows.
+        params["target"] = p.get("target").cloned().unwrap_or_default();
+        return crate::edit_cmds::paste_to_target(s, &params, false, Some(&limit), label);
+    }
+    let key = step_key(s, "pasteInto");
+    params["coalesce"] = json!(key);
+    params["target"] = json!("pixels");
     let r = s.execute("edit.paste", params)?;
     let id = layer_param(s, &Value::Null)?;
     s.execute("layer.layerMask.revealAll", json!({"layer": id.0, "coalesce": key}))?;
     s.coalesce_request = Some(key);
-    let r2 = s.edit(if outside { "Paste Outside" } else { "Paste Into" }, |doc, _| {
-        let canvas = doc.bounds();
+    let r2 = s.edit(label, |doc, _| {
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        let surface = if outside {
-            // Everything but the selection: default reveal, the selection's area inverted.
-            let area = b.intersect(&canvas);
-            let inv: Vec<f32> = sel::mask_from_surface(Some(&selection), area).iter().map(|v| 1.0 - v).collect();
-            let mut m = photocraft_raster::Surface::with_default(photocraft_color::PixelFormat::GRAY8, &[1.0]);
-            m.write_region(area, &inv);
-            m
-        } else {
-            selection
-        };
-        l.mask = Some(LayerMask { surface, linked: false, ..LayerMask::reveal_all() });
+        l.mask = Some(LayerMask { surface: limit, linked: false, ..LayerMask::reveal_all() });
         Ok(())
     });
     s.coalesce_request = None;
@@ -328,18 +338,36 @@ fn paste_into(s: &mut Session, p: &Value, outside: bool) -> Result<Value> {
     Ok(r)
 }
 
+/// The canvas grown to every layer's pixels: Image › Reveal All's new canvas, and what the Crop
+/// tool shows while a frame is edited.
+pub fn reveal_all_bounds(doc: &Document) -> Rect {
+    doc.walk().into_iter().filter_map(|(_, _, l)| l.surface().map(|s| s.content_bounds())).fold(doc.bounds(), |a, b| a.union(&b))
+}
+
 // ---------- layers ----------
 
 fn layer_from_background(s: &mut Session) -> Result<Value> {
     let id = s.edit("Layer From Background", |doc, active| {
         let l = doc.layers.first_mut().filter(|l| is_background(l)).ok_or(EngineError::Other("the document has no Background layer".into()))?;
-        l.name = "Layer 0".into();
-        l.locks.transparency = false;
-        l.locks.position = false;
+        unlock_background(l);
         *active = Some(l.id);
         Ok(l.id)
     })?;
     Ok(json!({"layer": id.0}))
+}
+
+fn unlock_background(l: &mut Layer) {
+    l.name = "Layer 0".into();
+    l.locks.transparency = false;
+    l.locks.position = false;
+}
+
+/// Before `id` gets a layer mask: the Background can't have one, so it becomes a normal layer
+/// first ("Layer 0"), as when adding a mask to it in Photoshop. Other layers are left alone.
+pub(crate) fn background_to_layer_for_mask(doc: &mut photocraft_doc::Document, id: photocraft_doc::LayerId) {
+    if let Some(l) = doc.layers.first_mut().filter(|l| l.id == id && is_background(l)) {
+        unlock_background(l);
+    }
 }
 
 fn toggle_mask(s: &mut Session, p: &Value, key: &str) -> Result<Value> {
@@ -440,6 +468,50 @@ fn set_visible(s: &mut Session, p: &Value, visible: bool) -> Result<Value> {
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// Is the layer at `path` shown alone: it and its enclosing groups visible, every layer outside
+/// it hidden (the layers inside a group keep their own visibility)?
+fn shown_alone(doc: &Document, path: &[usize]) -> bool {
+    doc.walk().iter().all(|(p, _, l)| if path.starts_with(p) { l.visible } else { p.starts_with(path) || !l.visible })
+}
+
+/// ⌥-click on a layer's eye: show only that layer (and its enclosing groups), or, when it already
+/// is shown alone, restore every layer's visibility from before (every layer shown when there is
+/// no snapshot). ⌥-clicking another eye while one layer is shown alone moves the solo and keeps
+/// the snapshot. One history step either way; the snapshot is view state.
+fn show_only(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = layer_param(s, p)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let doc = &st.doc;
+    let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
+    // The snapshot only counts while its solo is still in effect (an undo or a plain eye click ends it).
+    let saved = st.show_only.as_ref().filter(|(prev, _)| doc.path_of(*prev).is_some_and(|pp| shown_alone(doc, &pp)));
+    let walk = doc.walk();
+    let solo = !shown_alone(doc, &path);
+    let (label, rows, next): (_, Vec<(Vec<usize>, bool)>, _) = if solo {
+        let snapshot = saved.map_or_else(|| walk.iter().map(|(_, _, l)| (l.id, l.visible)).collect(), |(_, v)| v.clone());
+        // Layers inside the shown layer keep their visibility.
+        let rows = walk.iter().filter(|(p, _, _)| p.len() <= path.len() || !p.starts_with(&path)).map(|(p, _, _)| (p.clone(), path.starts_with(p))).collect();
+        ("Show Only This Layer", rows, Some((id, snapshot)))
+    } else {
+        let before: Option<std::collections::HashMap<LayerId, bool>> = saved.map(|(_, v)| v.iter().copied().collect());
+        // Layers added since the snapshot keep their current visibility.
+        let rows = walk.iter().map(|(p, _, l)| (p.clone(), before.as_ref().is_none_or(|b| b.get(&l.id).copied().unwrap_or(l.visible)))).collect();
+        ("Show Layers", rows, None)
+    };
+    s.edit(label, |doc, _| {
+        for (p, visible) in &rows {
+            if let Some(l) = doc.layer_at_mut(p) {
+                l.visible = *visible;
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(st) = s.active_mut() {
+        st.show_only = next;
+    }
+    Ok(json!({ "shownAlone": solo }))
 }
 
 /// Pixels of a fill or smart-object layer's content alone (no mask, effects or opacity).
@@ -562,13 +634,19 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paste Into",
             &["Edit", "Paste Special"],
             Some("Cmd+Alt+Shift+V"),
-            r##"{"center":[x,y]?}"##,
+            concat!(r#"{"center":[x,y]?,"#, crate::edit_cmds::paste_target!(), "}"),
             has_clip_and_selection,
             |s, p| paste_into(s, p, false)
         ),
-        spec!("edit.pasteSpecial.pasteOutside", "Paste Outside", &["Edit", "Paste Special"], None, r##"{"center":[x,y]?}"##, has_clip_and_selection, |s, p| {
-            paste_into(s, p, true)
-        }),
+        spec!(
+            "edit.pasteSpecial.pasteOutside",
+            "Paste Outside",
+            &["Edit", "Paste Special"],
+            None,
+            concat!(r#"{"center":[x,y]?,"#, crate::edit_cmds::paste_target!(), "}"),
+            has_clip_and_selection,
+            |s, p| paste_into(s, p, true)
+        ),
         spec!("select.reselect", "Reselect", &["Select"], Some("Cmd+Shift+D"), "{}", can_reselect, |s, _| {
             let m = reselect_target(s).ok_or(EngineError::Other("there is no selection to restore".into()))?;
             s.edit("Reselect", |doc, _| {
@@ -580,9 +658,8 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("image.adjustments.equalize", "Equalize", &["Image", "Adjustments"], None, "{}", has_pixels, |s, _| equalize(s)),
         spec!("image.revealAll", "Reveal All", &["Image"], None, "{}", has_doc, |s, _| {
             let d = s.active().ok_or(EngineError::NoDocument)?;
-            let canvas = d.doc.bounds();
-            let all = d.doc.walk().into_iter().filter_map(|(_, _, l)| l.surface().map(|s| s.content_bounds())).fold(canvas, |a, b| a.union(&b));
-            if all == canvas {
+            let all = reveal_all_bounds(&d.doc);
+            if all == d.doc.bounds() {
                 return Ok(json!({"changed": false}));
             }
             s.execute("image.crop", json!({"x": all.x0, "y": all.y0, "width": all.width(), "height": all.height(), "deleteCroppedPixels": false}))?;
@@ -592,7 +669,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("layer.layerStyle.copyLayerStyle", "Copy Layer Style", &["Layer", "Layer Style"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
             let l = s.active().and_then(|d| d.doc.layer(id)).ok_or(EngineError::NoLayer(id))?;
-            let style = (l.effects.clone(), l.blend, l.fill_opacity);
+            let style = (l.effects.clone(), l.blend, l.fill_opacity, l.advanced);
             s.style_clipboard = Some(style);
             Ok(Value::Null)
         }),
@@ -608,12 +685,13 @@ pub fn specs() -> Vec<CommandSpec> {
             },
             |s, p| {
                 let id = layer_param(s, p)?;
-                let (fx, blend, fill) = s.style_clipboard.clone().ok_or(EngineError::Other("no layer style has been copied".into()))?;
+                let (fx, blend, fill, advanced) = s.style_clipboard.clone().ok_or(EngineError::Other("no layer style has been copied".into()))?;
                 s.edit("Paste Layer Style", |doc, _| {
                     let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
                     l.effects = fx;
                     l.blend = blend;
                     l.fill_opacity = fill;
+                    l.advanced = advanced;
                     Ok(())
                 })?;
                 Ok(Value::Null)
@@ -673,6 +751,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec!("layer.hideLayers", "Hide Layers", &["Layer"], Some("Cmd+,"), r##"{"layer":id?}"##, has_layer, |s, p| set_visible(s, p, false)),
         spec!("layer.showLayers", "Show Layers", &[], None, r##"{"layer":id?}"##, has_layer, |s, p| set_visible(s, p, true)),
+        spec!(
+            "layer.showOnly",
+            "Show Only This Layer",
+            &[],
+            None,
+            r##"{"layer":id?} → {shownAlone} (⌥-click a layer's eye; again restores the other layers' visibility)"##,
+            has_layer,
+            show_only
+        ),
         spec!("filter.blur.average", "Average", &["Filter", "Blur"], None, "{}", has_pixels, |s, _| average(s)),
         spec!("filter.render.clouds", "Clouds", &["Filter", "Render"], None, r##"{"seed":u32=0}"##, has_pixels, |s, p| clouds(s, p, false)),
         spec!("filter.render.differenceClouds", "Difference Clouds", &["Filter", "Render"], None, r##"{"seed":u32=0}"##, has_pixels, |s, p| clouds(s, p, true)),
@@ -819,6 +906,92 @@ mod tests {
     }
 
     #[test]
+    fn option_click_eye_shows_one_layer_then_restores() {
+        let mut s = session(8);
+        s.execute("layer.new.layer", json!({})).unwrap();
+        let ids: Vec<LayerId> = doc(&s).layers.iter().map(|l| l.id).collect();
+        // Background, Layer 1 (hidden beforehand), Layer 2.
+        s.execute("layer.hideLayers", json!({"layer": ids[1].0})).unwrap();
+        let vis = |s: &Session| doc(s).layers.iter().map(|l| l.visible).collect::<Vec<_>>();
+        assert_eq!(s.execute("layer.showOnly", json!({"layer": ids[1].0})).unwrap()["shownAlone"], true);
+        assert_eq!(vis(&s), [false, true, false]);
+        // Another eye moves the solo; the original snapshot survives.
+        s.execute("layer.showOnly", json!({"layer": ids[2].0})).unwrap();
+        assert_eq!(vis(&s), [false, false, true]);
+        assert_eq!(s.execute("layer.showOnly", json!({"layer": ids[2].0})).unwrap()["shownAlone"], false);
+        assert_eq!(vis(&s), [true, false, true], "restored, with Layer 1 still hidden");
+        // One history step each way.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(vis(&s), [false, false, true]);
+    }
+
+    #[test]
+    fn show_only_keeps_groups_and_their_contents() {
+        let mut s = session(8);
+        s.execute("layer.new.layer", json!({})).unwrap();
+        let inner = active(&s).id;
+        let group = s.execute("layer.groupLayers", json!({"layer": inner.0})).unwrap()["layer"].as_u64().map(LayerId).unwrap();
+        let shown = |s: &Session| doc(s).walk().iter().map(|(_, _, l)| l.visible).collect::<Vec<_>>();
+        // Background, Layer 1, Group 1, Layer 2 (inside the group).
+        s.execute("layer.showOnly", json!({"layer": inner.0})).unwrap();
+        assert_eq!(shown(&s), [false, false, true, true], "the enclosing group stays visible");
+        // An undo ends the solo, so the next ⌥-click solos again from the current state.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.execute("layer.showOnly", json!({"layer": inner.0})).unwrap()["shownAlone"], true);
+        s.execute("edit.undo", json!({})).unwrap();
+        // Showing a group alone leaves its contents as they are.
+        s.execute("layer.setProps", json!({"layer": inner.0, "visible": false})).unwrap();
+        s.execute("layer.showOnly", json!({"layer": group.0})).unwrap();
+        assert_eq!(shown(&s), [false, false, true, false]);
+        s.execute("layer.showOnly", json!({"layer": group.0})).unwrap();
+        assert_eq!(shown(&s), [true, true, true, false]);
+    }
+
+    #[test]
+    fn show_only_without_a_snapshot_shows_every_layer() {
+        let mut s = session(16);
+        let bg = doc(&s).layers[0].id;
+        s.execute("layer.hideLayers", json!({"layer": bg.0})).unwrap();
+        // Layer 1 is already the only visible layer: ⌥-clicking it shows everything.
+        assert_eq!(s.execute("layer.showOnly", json!({})).unwrap()["shownAlone"], false);
+        assert!(doc(&s).layers.iter().all(|l| l.visible));
+        assert!(s.execute("layer.showOnly", json!({"layer": 9999})).is_err());
+        assert!(Session::new().execute("layer.showOnly", json!({})).is_err());
+    }
+
+    #[test]
+    fn a_mask_turns_the_background_into_a_layer() {
+        for (cmd, needs_selection) in [
+            ("layer.layerMask.revealAll", false),
+            ("layer.layerMask.hideAll", false),
+            ("layer.layerMask.revealSelection", true),
+            ("layer.layerMask.hideSelection", true),
+        ] {
+            let mut s = session(8);
+            let bg = doc(&s).layers[0].id;
+            if needs_selection {
+                s.execute("select.rect", json!({"x": 2, "y": 2, "width": 10, "height": 10})).unwrap();
+            }
+            s.execute(cmd, json!({"layer": bg.0})).unwrap();
+            let l = &doc(&s).layers[0];
+            assert!(l.mask.is_some() && l.name == "Layer 0" && !l.locks.transparency && !l.locks.position, "{cmd}");
+            assert!(!s.is_enabled("layer.new.layerFromBackground"), "{cmd}");
+            // One step: undo brings the locked Background back, without a mask.
+            assert!(s.undo());
+            let l = &doc(&s).layers[0];
+            assert!(l.mask.is_none() && l.name == "Background" && l.locks.transparency, "{cmd}");
+        }
+        // Other layers keep their name and locks.
+        let mut s = session(8);
+        let top = doc(&s).layers[1].id;
+        s.execute("layer.setProps", json!({"layer": top.0, "locks": {"position": true}})).unwrap();
+        s.execute("layer.layerMask.revealAll", json!({"layer": top.0})).unwrap();
+        let l = doc(&s).layer(top).unwrap();
+        assert!(l.mask.is_some() && l.name != "Layer 0" && l.locks.position);
+        assert_eq!(doc(&s).layers[0].name, "Background");
+    }
+
+    #[test]
     fn layer_utilities() {
         let mut s = session(8);
         // Layer from Background.
@@ -869,6 +1042,7 @@ mod tests {
         let mut s = session(8);
         s.execute("layer.translate", json!({"dx": 0, "dy": 0})).ok();
         paint_square(&mut s, Rect::new(-5, 0, 10, 10), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(reveal_all_bounds(doc(&s)), Rect::new(-5, 0, 40, 30));
         s.execute("image.revealAll", json!({})).unwrap();
         assert_eq!((doc(&s).size.width, doc(&s).size.height), (45, 30));
         assert_eq!(s.execute("image.revealAll", json!({})).unwrap()["changed"], false);

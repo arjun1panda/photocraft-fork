@@ -58,7 +58,7 @@ echo "==> PhotoCraft $VERSION for macOS ($ARCH), identity: $IDENTITY, notarize: 
 if [ "$SKIP_BUILD" = 0 ]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
-  (cd "$ROOT" && cargo build --release --locked -p photocraft -p photocraft-cli "${args[@]}")
+  (cd "$ROOT" && cargo build --release --locked -p photocraft -p photocraft-cli --features heif "${args[@]}")
 fi
 
 rm -rf "$WORK"
@@ -103,6 +103,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Executable and icon carry the display name (CFBundleExecutable / CFBundleIconFile).
 cp "$WORK/bin/photocraft" "$APP/Contents/MacOS/PhotoCraft"
 cp "$ROOT/assets/app-icon/photocraft.icns" "$APP/Contents/Resources/PhotoCraft.icns"
+# Licences of the embedded craft-fonts fonts (only when built with CRAFT_FONTS_DIR).
+if [ -n "${CRAFT_FONTS_DIR:-}" ]; then
+  mkdir -p "$APP/Contents/Resources/Licenses"
+  copy_font_licences "$APP/Contents/Resources/Licenses"
+fi
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \
   -e "s/@BUILD_SHA@/${PHOTOCRAFT_BUILD_SHA:-unknown}/g" \
   "$HERE/Info.plist.in" >"$APP/Contents/Info.plist"
@@ -129,10 +134,15 @@ STAGE="$WORK/dmg"
 mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/PhotoCraft.app"
 ln -s /Applications "$STAGE/Applications"
+# Finder window layout: background, icon size and positions (packaging/macos/dmg/README.md).
+mkdir -p "$STAGE/.background"
+cp "$HERE/dmg/background.tiff" "$STAGE/.background/background.tiff"
+cp "$HERE/dmg/dmg-layout.DS_Store" "$STAGE/.DS_Store"
 rm -f "$DMG" "$WORK/raw.dmg"
 # makehybrid + convert builds the image without attaching a device, unlike `create -srcfolder`,
 # which is flaky on CI runners ("Resource busy") and hangs in sandboxed sessions.
-hdiutil makehybrid -hfs -hfs-volume-name "PhotoCraft $VERSION" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
+# The volume name has no version: .DS_Store finds the background through an alias that includes it.
+hdiutil makehybrid -hfs -hfs-volume-name "PhotoCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
 hdiutil convert "$WORK/raw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
 rm -f "$WORK/raw.dmg"
 sign "$DMG"
@@ -150,13 +160,16 @@ CLI_DIR="$WORK/photocraft-cli-$VERSION-macos-$ARCH"
 mkdir -p "$CLI_DIR"
 cp "$WORK/bin/photocraft-cli" "$CLI_DIR/"
 copy_docs "$CLI_DIR"
-sign --options runtime "$CLI_DIR/photocraft-cli"
+# Same Developer ID and hardened runtime as the app, with an explicit reverse-DNS identifier
+# (codesign would otherwise use the bare file name).
+sign --options runtime --identifier ai.storyteller.photocraft-cli "$CLI_DIR/photocraft-cli"
 codesign --verify --strict --verbose=2 "$CLI_DIR/photocraft-cli"
 rm -f "$CLI_ZIP"
 ditto -c -k --keepParent "$CLI_DIR" "$CLI_ZIP"
-# A bare Mach-O can't carry a stapled ticket; Gatekeeper looks the notarization up online.
+# notarytool accepts a zip of the bare binary. A bare Mach-O can't carry a stapled ticket, so
+# Gatekeeper looks the notarization up online when a quarantined copy first runs.
 if [ "$NOTARIZE" = 1 ]; then notarize "$CLI_ZIP"; fi
 
 "$WORK/bin/photocraft-cli" --version
-echo "==> done"
+echo "==> done (check the artifacts as shipped with packaging/macos/verify.sh --arch $ARCH)"
 ls -lh "$DMG" "$CLI_ZIP"

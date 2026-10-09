@@ -38,6 +38,8 @@ const F_MASK_TEX: u32 = 2u;      // mask pixels live in `mask_tex`
 const F_TEX: u32 = 4u;           // layer pixels live in `layer_tex`
 const F_GRADIENT: u32 = 8u;      // gradient fill (stops in `lut_tex`)
 const F_KNOCKOUT: u32 = 16u;     // effect paint: the layer knocks out the coverage (drop shadow)
+const F_NO_LAYER: u32 = 32u;    // effect merge: A already holds the layer (only the opacity mix)
+const F_OUTLINE: u32 = 131072u;      // outside strokes: filled shape outline (effects::outline_share)
 const F_VECTOR: u32 = 64u;       // effect paint: shape layer (outside stroke never inside)
 const F_ATOP: u32 = 128u;        // effect merge: clipped layer over an opaque base
 const F_GATE: u32 = 256u;        // effect paint: coverage only inside the layer's shape
@@ -240,7 +242,17 @@ fn composite(mode: i32, b: vec4<f32>, s: vec4<f32>, opacity: f32) -> vec4<f32> {
     return vec4(rgb, ao);
 }
 
-// `psblend::composite_gamma`: coverage mixed in a gamma space (type layers, gamma 1.45).
+// `psblend::text_encode` / `text_decode`: linear light raised to 1 / gamma.
+fn text_enc(c: vec3<f32>, g: f32) -> vec3<f32> {
+    let l = vec3(srgb_to_linear(max(c.r, 0.0)), srgb_to_linear(max(c.g, 0.0)), srgb_to_linear(max(c.b, 0.0)));
+    return pow(l, vec3(1.0 / g));
+}
+fn text_dec(v: vec3<f32>, g: f32) -> vec3<f32> {
+    let l = pow(max(v, vec3(0.0)), vec3(g));
+    return vec3(linear_to_srgb(l.r), linear_to_srgb(l.g), linear_to_srgb(l.b));
+}
+
+// `psblend::composite_gamma`: coverage mixed in the text blending space (type layers, 1.45).
 fn composite_g(mode: i32, b: vec4<f32>, s: vec4<f32>, opacity: f32, gamma_on: bool) -> vec4<f32> {
     if (!gamma_on) { return composite(mode, b, s, opacity); }
     let ab = b.a;
@@ -250,8 +262,8 @@ fn composite_g(mode: i32, b: vec4<f32>, s: vec4<f32>, opacity: f32, gamma_on: bo
     let ao = as_ + ab * (1.0 - as_);
     if (ao <= 0.0) { return vec4(0.0); }
     let g = op.p4.w; // psblend::text_gamma
-    let pw = (1.0 - as_) * ab * pow(max(b.rgb, vec3(0.0)), vec3(g)) + (1.0 - ab) * as_ * pow(max(s.rgb, vec3(0.0)), vec3(g)) + as_ * ab * pow(max(bl, vec3(0.0)), vec3(g));
-    return vec4(pow(pw / ao, vec3(1.0 / g)), ao);
+    let pw = (1.0 - as_) * ab * text_enc(b.rgb, g) + (1.0 - ab) * as_ * text_enc(s.rgb, g) + as_ * ab * text_enc(bl, g);
+    return vec4(text_dec(pw / ao, g), ao);
 }
 
 // photocraft_color::convert::{srgb_to_lab, lab_to_srgb} (D50, Bradford to sRGB).
@@ -310,6 +322,42 @@ fn t_decode(v: f32, g: f32) -> f32 {
 fn t_encode(v: f32, g: f32) -> f32 {
     if (g <= 0.0) { return linear_to_srgb(max(v, 0.0)); }
     return pow(max(v, 0.0), 1.0 / g);
+}
+
+// compose::adjust::vibrance_lin: Photoshop's Vibrance slider (v in [-1, 1]) as an HSV change in
+// linear light that keeps the hue; b0 = boost fit (c0, c1, p, q), b1 = (r0, ra, rt).
+fn vibrance_lin(c: vec3<f32>, v: f32, b0: vec4<f32>, b1: vec3<f32>) -> vec3<f32> {
+    let mx = max(max(c.r, c.g), c.b);
+    let mn = min(min(c.r, c.g), c.b);
+    if (mx <= 0.0 || mx - mn <= 1e-9) { return c; }
+    let t = 1.0 - mn / mx;
+    let shape = t * (1.0 - t) * (2.0 - t + t * t) * mx * max(1.0 - mx, 0.0);
+    var t2: f32;
+    var v2: f32;
+    if (v < 0.0) {
+        let a = -v;
+        t2 = t * (1.0 - a / 4.0) * (1.0 - a + a * t * (1.0 + t) / 2.0);
+        v2 = mx - a * shape;
+    } else {
+        let d = mx - mn;
+        var h: f32;
+        if (mx == c.r) { h = rem_euclid((c.g - c.b) / d, 6.0); }
+        else if (mx == c.g) { h = (c.b - c.r) / d + 2.0; }
+        else { h = (c.r - c.g) / d + 4.0; }
+        h = h * 60.0;
+        var w = 0.0;
+        if (h <= 30.0) { w = 1.0; }
+        else if (h < 45.0) { w = (45.0 - h) / 15.0; }
+        else if (h >= 300.0) { w = (h - 300.0) / 60.0; }
+        let a = v * (1.0 - w) + 0.64 * pow(v, 1.6) * w;
+        let boost = (b0.x * a + b0.y * a * a) * pow(t, b0.z) * pow(1.0 - t, b0.w)
+            * exp((b1.x + b1.y * a + b1.z * (1.0 - t)) * max(1.0 - mx, 0.0));
+        t2 = min(t * (1.0 + boost), 1.0);
+        v2 = mx + v / 4.0 * shape;
+    }
+    let m2 = v2 * (1.0 - t2);
+    let k = (v2 - m2) / (mx - mn);
+    return vec3(m2) + (c - vec3(mn)) * k;
 }
 
 fn rgb_to_hsl(c: vec3<f32>) -> vec3<f32> {
@@ -510,10 +558,16 @@ fn adjust(c: vec3<f32>) -> vec3<f32> {
             return rgb;
         }
         case 9: {                                                              // Vibrance
-            let hsl = rgb_to_hsl(c);
-            let boost = p0.x * (1.0 - hsl.y);
-            let ns = clamp(hsl.y * (1.0 + p0.y) + boost * max(hsl.y, 0.1), 0.0, 1.0);
-            return hsl_to_rgb(hsl.x, ns, hsl.z);
+            // compose::adjust::vibrance_px: linear light (transfer p0.z), Vibrance (p0.x, boost
+            // fit p1, p2.xyz) then Saturation (p0.y) towards 0.288 R + 0.712 G; p0.w the ceiling.
+            var l = vec3(t_decode(c.r, p0.z), t_decode(c.g, p0.z), t_decode(c.b, p0.z));
+            if (p0.x != 0.0) { l = vibrance_lin(l, p0.x, p1, p2.xyz); }
+            if (p0.y != 0.0) {
+                let g = 0.288 * l.r + 0.712 * l.g;
+                l = clamp(vec3(g) + (1.0 + p0.y) * (l - vec3(g)), vec3(0.0), vec3(p0.w));
+            }
+            l = clamp(l, vec3(0.0), vec3(p0.w));
+            return vec3(t_encode(l.r, p0.z), t_encode(l.g, p0.z), t_encode(l.b, p0.z));
         }
         case 10: {                                                             // Channel mixer
             let r = clamp(dot(p0.xyz, c) + p0.w, 0.0, 1.0);
@@ -521,13 +575,12 @@ fn adjust(c: vec3<f32>) -> vec3<f32> {
             return vec3(r, clamp(dot(p1.xyz, c) + p1.w, 0.0, 1.0), clamp(dot(p2.xyz, c) + p2.w, 0.0, 1.0));
         }
         case 11: {                                                             // Photo filter
-            let f = c * (1.0 - p0.w) + c * p0.rgb * p0.w;
-            if (p1.x > 0.5) {
-                let l0 = gray(c);
-                let l1 = max(gray(f), 1e-6);
-                return clamp(f * l0 / l1, vec3(0.0), vec3(1.0));
-            }
-            return f;
+            // compose::adjust::photo_filter_matrix (rows p0..p2) in linear light, then SetLum.
+            let g = p3.y;
+            let lin = vec3(t_decode(c.r, g), t_decode(c.g, g), t_decode(c.b, g));
+            var f = vec3(t_encode(dot(p0.xyz, lin), g), t_encode(dot(p1.xyz, lin), g), t_encode(dot(p2.xyz, lin), g));
+            if (p3.x > 0.5) { f = set_lum(f, lum(c)); }
+            return clamp(f, vec3(0.0), vec3(1.0));
         }
         case 12: {                                                             // Black & White
             // compose::adjust::black_white_gray: grey + secondary + primary parts, weighted.
@@ -593,23 +646,39 @@ fn gradient_t(d: vec2<i32>) -> f32 {
     let len = max(sqrt((c * w) * (c * w) + (s * h) * (s * h)), 1.0) * max(op.p0.y, 1e-3);
     // effects::gradient_t: Linear / Reflected span the bounds' chord along the angle.
     let chord = max(min(w / max(abs(c), 1e-6), h / max(abs(s), 1e-6)), 1.0) * max(op.p0.y, 1e-3);
+    // Linear / Reflected sample the pixel's top-left corner (effects::gradient_t).
+    let corner = 0.5 * (c - s);
     var t: f32;
     switch i32(op.p0.w) {
         case 1: { t = sqrt(dx * dx + dy * dy) / (len / 2.0); }                  // Radial
         case 2: { t = rem_euclid((a - atan2(-dy, dx)) / 6.28318530718, 1.0); }   // Angle
-        case 3: { t = abs(along / (chord / 2.0)); }                             // Reflected
+        case 3: { t = abs((along - corner) / (chord / 2.0)); }                  // Reflected
         case 4: { t = (abs(along) + abs(across)) / (len / 2.0); }               // Diamond
-        default: { t = along / chord + 0.5; }                                   // Linear
+        default: { t = (along - corner) / chord + 0.5; }                        // Linear
     }
     t = clamp(t, 0.0, 1.0);
     if (op.p0.z > 0.5) { t = 1.0 - t; }
     return t;
 }
 
+// photocraft_color::dither_noise: the gradient dither's position hash, in [0, 1).
+fn dither_noise(d: vec2<i32>) -> f32 {
+    var h = (bitcast<u32>(d.x) * 0x9E3779B1u) ^ (bitcast<u32>(d.y) * 0x85EBCA77u);
+    h = h ^ (h >> 15u);
+    h = h * 0x2C1B3C6Du;
+    h = h ^ (h >> 12u);
+    return f32(h & 0xFFFFu) / 65535.0;
+}
+
 fn layer_texel(d: vec2<i32>) -> vec4<f32> {
     if ((op.flags & F_GRADIENT) != 0u) {
         let t = gradient_t(d);
-        return vec4(lut(0, t), lut(1, t), lut(2, t), lut(3, t));
+        var c = vec4(lut(0, t), lut(1, t), lut(2, t), lut(3, t));
+        // p2.w: dither (gradient fills).
+        if (op.p2.w > 0.5) {
+            c = vec4(clamp(c.rgb + (dither_noise(d) - 0.5) / 255.0, vec3(0.0), vec3(1.0)), c.a);
+        }
+        return c;
     }
     if ((op.flags & F_TEX) != 0u) {
         let q = d - op.tex_origin;
@@ -687,7 +756,7 @@ fn fs_adjmix(in: VOut) -> @location(0) vec4<f32> {
     return vec4(b.rgb + (bl - b.rgb) * k, b.a);
 }
 
-// Pass-through group opacity/mask: lerp(A, B, opacity × mask) on all channels.
+// Pass-through group coverage mixes premultiplied colour, then returns straight alpha.
 @fragment
 fn fs_lerp(in: VOut) -> @location(0) vec4<f32> {
     let p = local(in.pos);
@@ -708,7 +777,11 @@ fn fs_lerp(in: VOut) -> @location(0) vec4<f32> {
         return vec4(clamp(pm.rgb / al, vec3(0.0), vec3(1.0)), al);
     }
     let k = op.opacity * mask_value(doc_px(p));
-    return a + (b - a) * k;
+    let wa = a.a * (1.0 - k);
+    let wb = b.a * k;
+    let alpha = wa + wb;
+    if (alpha <= 0.0) { return vec4(0.0); }
+    return vec4((a.rgb * wa + b.rgb * wb) / alpha, alpha);
 }
 
 // ---- layer effects (compose::effects::composite_with_effects) -------------------------------
@@ -761,7 +834,7 @@ fn pattern_sample(d: vec2<i32>) -> vec4<f32> {
 }
 
 // Effect paint colour at `d`: p2.z = 0 solid (`color`), 1 gradient (stops in `lut_tex`),
-// 2 pattern.
+// 2 pattern (4, a glow's gradient, is resolved in `fs_fxpaint`).
 fn fx_color(d: vec2<i32>) -> vec4<f32> {
     let kind = i32(op.p2.z);
     if (kind == 1) {
@@ -776,7 +849,10 @@ fn fx_color(d: vec2<i32>) -> vec4<f32> {
 
 // Effect chain steps (`kind`): 0 A at `opacity` × alpha; 1 an opaque copy of A (a clipping base
 // for clipped layers' effects); 2 A's colour with alpha `opacity` inside B's shape (the layer
-// before its interior effects); 3 A with its alpha × B's alpha (the shape's own alpha).
+// before its interior effects); 3 A with its alpha × B's alpha (the shape's own alpha); 4 the
+// vector stroke C over A, relative to the shape B, at `opacity`; 5 A's colour with alpha
+// `opacity` × A's alpha relative to B's (the layer within a filled shape's outline); 6 the
+// outside-stroke coverage seed (0, A's alpha); 7 A with alpha joined with the effect shape (map).
 @fragment
 fn fs_fxinit(in: VOut) -> @location(0) vec4<f32> {
     let p = local(in.pos);
@@ -785,8 +861,30 @@ fn fs_fxinit(in: VOut) -> @location(0) vec4<f32> {
         case 1: { return vec4(c.rgb, 1.0); }
         case 2: { return vec4(c.rgb, select(0.0, op.opacity, c.a > INSIDE_EPS)); }
         case 3: { return vec4(c.rgb, c.a * min(textureLoad(tex_b, p, 0).a, 1.0)); }
+        case 4: {
+            let a = textureLoad(tex_b, p, 0).a;
+            let s = textureLoad(tex_c, p, 0);
+            if (s.a <= 0.0 || a <= INSIDE_EPS) { return c; }
+            return composite(op.mode, c, vec4(s.rgb, op.opacity * min(s.a / a, 1.0)), 1.0);
+        }
+        case 5: {
+            let a = textureLoad(tex_b, p, 0).a;
+            if (a <= INSIDE_EPS) { return vec4(c.rgb, 0.0); }
+            return vec4(c.rgb, op.opacity * min(c.a / a, 1.0));
+        }
+        case 6: { return vec4(0.0, c.a, 0.0, 0.0); }
+        case 7: { return vec4(c.rgb, max(c.a, map_value(doc_px(p), 0.0))); }
         default: { return vec4(c.rgb, c.a * op.opacity); }
     }
+}
+
+// effects::outline_share: an outside stroke's share of an edge pixel the outline covers `cov` of,
+// beneath a layer of alpha `l` (disjoint areas).
+fn outline_share(cov: f32, l: f32) -> f32 {
+    let outside = max(1.0 - clamp(cov, 0.0, 1.0), 0.0);
+    let rest = 1.0 - clamp(l, 0.0, 1.0);
+    if (rest <= 1e-6) { return 1.0; }
+    return min(outside / rest, 1.0);
 }
 
 // effects::paint: composite `colour × coverage × opacity` into A. B is the layer (its alpha `a`
@@ -811,6 +909,13 @@ fn fs_fxpaint(in: VOut) -> @location(0) vec4<f32> {
     if ((op.flags & F_STROKE_OUT) != 0u && inside_shape) {
         m = select(1.0, 0.0, (op.flags & F_VECTOR) != 0u);
     }
+    if (i32(op.p2.z) == 4) {
+        // effects::paint_glow: the gradient at 1 - strength, opaque from strength 1 / gain (p0.x).
+        let k = min(m * op.p0.x, 1.0) * op.opacity;
+        if (k <= 0.0) { return dst; }
+        let t = 1.0 - clamp(m, 0.0, 1.0);
+        return composite(op.mode, dst, vec4(lut(0, t), lut(1, t), lut(2, t), lut(3, t) * k), 1.0);
+    }
     let k = m * op.opacity;
     if (k <= 0.0) { return dst; }
     let c = fx_color(d);
@@ -818,21 +923,41 @@ fn fs_fxpaint(in: VOut) -> @location(0) vec4<f32> {
 }
 
 // Outside strokes (A = the exterior result before them, B = the layer, C = coverage so far in
-// `.r`, D (`layer_tex`) = accumulated premultiplied colour). Each stroke takes its band × opacity
-// not yet covered above it; `kind` 0 accumulates that share of the stroke blended over A at full
+// `.r` and, along a filled shape's outline (F_OUTLINE), the layer's alpha in `.g`, D
+// (`layer_tex`) = accumulated premultiplied colour). Each stroke takes its band × opacity not yet
+// covered above it; `kind` 0 accumulates that share of the stroke blended over A at full
 // coverage, `kind` 1 the coverage.
 @fragment
 fn fs_fxstroke(in: VOut) -> @location(0) vec4<f32> {
     let p = local(in.pos);
     let d = doc_px(p);
     let a = textureLoad(tex_b, p, 0).a;
-    var k = map_value(d, 0.0);
-    if (a > INSIDE_EPS) { k = select(1.0, 0.0, (op.flags & F_VECTOR) != 0u); }
+    let outline = (op.flags & F_OUTLINE) != 0u;
     let first = (op.flags & F_FIRST) != 0u;
     var cover = 0.0;
-    if (!first) { cover = textureLoad(tex_c, p, 0).r; }
+    var lay_a = 0.0;
+    let vector = (op.flags & F_VECTOR) != 0u;
+    if (!first || outline || !vector) {
+        let cv = textureLoad(tex_c, p, 0);
+        cover = cv.r;
+        lay_a = cv.g;
+    }
+    var k = map_value(d, 0.0);
+    if (outline) {
+        k = k * outline_share(a, lay_a);
+    } else if (a > INSIDE_EPS) {
+        // Pixel layers: the stroke shows beneath only through the part the shape leaves
+        // (`effects.rs`): (1 - a) / (1 - layer alpha), 1 under an opaque layer.
+        if (vector) {
+            k = 0.0;
+        } else if (lay_a >= 1.0) {
+            k = 1.0;
+        } else {
+            k = clamp((1.0 - clamp(a, 0.0, 1.0)) / (1.0 - lay_a), 0.0, 1.0);
+        }
+    }
     let share = k * op.opacity * (1.0 - cover);
-    if (op.kind == 1) { return vec4(cover + share, 0.0, 0.0, 0.0); }
+    if (op.kind == 1) { return vec4(cover + share, lay_a, 0.0, 0.0); }
     var acc = vec4(0.0);
     if (!first) { acc = textureLoad(layer_tex, p, 0); }
     if (share > 0.0) {
@@ -876,7 +1001,7 @@ fn fs_fxmerge(in: VOut) -> @location(0) vec4<f32> {
     var w = textureLoad(tex_a, p, 0);
     let l = textureLoad(tex_b, p, 0);
     let c = textureLoad(tex_c, p, 0);
-    if (l.a > 0.0) { w = composite_g(op.mode, w, l, 1.0, (op.flags & F_TEXT_GAMMA) != 0u); }
+    if (l.a > 0.0 && (op.flags & F_NO_LAYER) == 0u) { w = composite_g(op.mode, w, l, 1.0, (op.flags & F_TEXT_GAMMA) != 0u); }
     let atop = (op.flags & F_ATOP) != 0u;
     var before = c;
     if (atop) { before = vec4(c.rgb, 1.0); }
@@ -996,19 +1121,33 @@ fn fs_mbevelh(in: VOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_mbevelshade(in: VOut) -> @location(0) vec4<f32> {
     let p = local(in.pos);
-    let depth = op.p1.x;
+    let s = textureLoad(layer_tex, p, 0).r;
+    // effects::bevel_maps' on_bevel: the height above BEVEL_H_EPS (emboss styles: or a
+    // 4-neighbour's).
+    var hmax = ra(p);
+    if (op.p1.y > 1.5) {
+        hmax = max(max(hmax, max(ra(p + vec2(1, 0)), ra(p - vec2(1, 0)))), max(ra(p + vec2(0, 1)), ra(p - vec2(0, 1))));
+    }
+    let outside = select(0.0, 1.0, s < 1.0 - INSIDE_EPS && hmax > 1e-5);
+    // p1.y: 0 inside (× alpha), 1 under the edge and outside (outer bevel), 2 / 3 emboss / pillow
+    // emboss (inside where the shape is, plus the outside half, flipped for pillow, × 1 − alpha).
+    if (op.p1.y < 0.5) { return mout(bevel_part(p, op.p1.x, s)); }
+    if (op.p1.y < 1.5) { return mout(bevel_part(p, op.p1.x, outside)); }
+    var inner = 0.0;
+    if (s > INSIDE_EPS) { inner = bevel_part(p, op.p1.x, s); }
+    let od = select(op.p1.x, -op.p1.x, op.p1.y > 2.5);
+    return mout(inner + bevel_part(p, od, outside) * (1.0 - min(s, 1.0)));
+}
+
+// One bevel shading value (`bevel_maps`' shade_into): highlight (p1.z = 0) or shadow amount for
+// height-gradient scale `depth`, times `region`, through the gloss contour.
+fn bevel_part(p: vec2<i32>, depth: f32, region: f32) -> f32 {
     let gx = (ra(p + vec2(1, 0)) - ra(p - vec2(1, 0))) * 0.5 * depth;
     let gy = (ra(p + vec2(0, 1)) - ra(p - vec2(0, 1))) * 0.5 * depth;
     let n = vec3(-gx, -gy, 1.0);
     let len = sqrt(n.x * n.x + n.y * n.y + 1.0);
     let shade = (n.x * op.p0.x + n.y * op.p0.y + n.z * op.p0.z) / len;
     let se = op.p0.w;
-    let s = textureLoad(layer_tex, p, 0).r;
-    var region = s;
-    if (op.p1.y > 0.5) {
-        // Outside parts paint at full strength wherever the shape isn't opaque (edge pixels too).
-        region = select(0.0, 1.0, s < 1.0 - INSIDE_EPS && textureLoad(tex_a, p, 0).r > 1e-5); // effects::BEVEL_H_EPS
-    }
     let k = shade - se;
     var v = 0.0;
     if (op.p1.z > 0.5) {
@@ -1017,7 +1156,7 @@ fn fs_mbevelshade(in: VOut) -> @location(0) vec4<f32> {
         v = clamp(k / max(1.0 - se, 1e-3), 0.0, 1.0) * region;
     }
     if (op.p1.w > 0.5) { v = lut(0, v); }
-    return mout(v);
+    return v;
 }
 
 // Bevel texture (`effects::bevel_height`): A + k × luminance of the pattern (× its alpha; 1 −

@@ -44,6 +44,7 @@ pub fn document(d: &DocState) -> Value {
         "revision": d.revision,
         "channels": crate::channel_cmds::channels_json(d),
         "quickMask": doc.quick_mask.is_some(),
+        "layerMaskView": crate::mask_view_cmds::view_json(d),
         "layerComps": doc.layer_comps.iter().map(|c| json!({"id": c.id, "name": c.name})).collect::<Vec<_>>(),
         "lastAppliedComp": doc.last_applied_comp,
         "measurement": {"scale": doc.measurement.scale.describe(), "ruler": doc.measurement.ruler.map(|r| json!({"start": r.start, "end": r.end, "protractor": r.protractor})), "count": doc.measurement.count_total(), "countGroups": doc.measurement.count_groups.len()},
@@ -73,6 +74,7 @@ fn layer_sel(l: &Layer, selected: &[photocraft_doc::LayerId]) -> Value {
         "name": l.name,
         "kind": l.content.kind_name(),
         "visible": l.visible,
+        "labelColor": l.label.id(),
         "opacity": l.opacity,
         "fill": l.fill_opacity,
         "blend": l.blend.label(),
@@ -85,6 +87,7 @@ fn layer_sel(l: &Layer, selected: &[photocraft_doc::LayerId]) -> Value {
     match &l.content {
         LayerContent::Group(g) => {
             v["children"] = Value::Array(g.children.iter().rev().map(|c| layer_sel(c, selected)).collect());
+            v["expanded"] = json!(g.expanded);
             if let Some(a) = &g.artboard {
                 v["artboard"] = json!({"rect": [a.rect.x0, a.rect.y0, a.rect.width(), a.rect.height()], "background": a.background.name(), "preset": a.preset});
             }
@@ -109,6 +112,10 @@ fn layer_sel(l: &Layer, selected: &[photocraft_doc::LayerId]) -> Value {
     // Advanced Blending › Channels (only when some channel is left out).
     if l.excluded_channels != 0 {
         v["channels"] = json!((0..4).map(|i| l.excluded_channels & (1 << i) == 0).collect::<Vec<_>>());
+    }
+    // Blending Options › Advanced Blending switches (only when one differs from Photoshop's default).
+    if !l.advanced.is_default() {
+        v["advancedBlending"] = serde_json::to_value(l.advanced).unwrap_or(Value::Null);
     }
     // Blending Options › Blend If (only when set): range index (0 = Gray, then the mode's
     // channels) with This Layer / Underlying Layer as [blackLo, blackHi, whiteLo, whiteHi].

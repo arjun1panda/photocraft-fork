@@ -105,6 +105,67 @@ fn metadata_is_read() {
     assert_eq!((d.width, d.height), (20, 16));
 }
 
+#[test]
+fn enormous_double_crop_origin_is_rejected() {
+    let (w, h) = (16, 12);
+    let mut spec = DngSpec::cfa(w, h, vec![1000; w * h]);
+    spec.active_area = Some([2, 3, 10, 14]);
+    spec.default_crop = Some(([0, 0], [11, 8]));
+    spec.default_crop_origin_double = Some([1e300, 0.0]);
+
+    assert!(matches!(decode(&spec.build(), &Limits::default()), Err(RawError::Malformed(_))));
+}
+
+#[test]
+fn out_of_range_default_crop_falls_back_to_active_area_with_warning() {
+    let (w, h) = (16, 12);
+    let mut spec = DngSpec::cfa(w, h, vec![1000; w * h]);
+    spec.active_area = Some([2, 3, 10, 14]);
+    spec.default_crop = Some(([10, 0], [5, 4]));
+
+    let s = sensor(&spec.build());
+    assert_eq!(s.crop, s.active);
+    assert!(s.warnings.iter().any(|warning| warning.contains("out-of-range") && warning.contains("default crop")), "{:?}", s.warnings);
+}
+
+/// DefaultCropSize defaults to the whole image, which can't fit once the origin moves in.
+#[test]
+fn default_crop_origin_without_size_falls_back_to_active_area_with_warning() {
+    let (w, h) = (16, 12);
+    let mut spec = DngSpec::cfa(w, h, vec![1000; w * h]);
+    spec.active_area = Some([2, 3, 10, 14]);
+    spec.default_crop_origin_double = Some([1.0, 1.0]);
+
+    let s = sensor(&spec.build());
+    assert_eq!(s.crop, s.active);
+    assert!(s.warnings.iter().any(|warning| warning.contains("out-of-range") && warning.contains("default crop")), "{:?}", s.warnings);
+}
+
+/// #950: DefaultCropOrigin defaults to (0, 0), so a size-only crop starts at the active area's
+/// top-left corner.
+#[test]
+fn default_crop_size_without_origin_crops_from_the_active_area_origin() {
+    let (w, h) = (8, 8);
+    let mut spec = DngSpec::cfa(w, h, (0..w * h).map(|i| (i as u16) * 37).collect());
+    spec.active_area = Some([0, 0, 8, 8]);
+    spec.default_crop_size_only = Some([4, 4]);
+    let bytes = spec.build();
+
+    let s = sensor(&bytes);
+    assert_eq!(s.crop, Rect::new(0, 0, 4, 4));
+    assert!(s.warnings.iter().all(|warning| !warning.contains("default crop")), "{:?}", s.warnings);
+    let d = develop(&bytes, &DevelopOptions::default()).unwrap();
+    assert_eq!((d.width, d.height), (4, 4));
+
+    // Inside an offset active area the crop starts at that area's corner.
+    let (w, h) = (16, 12);
+    let mut spec = DngSpec::cfa(w, h, vec![1000; w * h]);
+    spec.active_area = Some([2, 3, 10, 14]);
+    spec.default_crop_size_only = Some([6, 4]);
+    let s = sensor(&spec.build());
+    assert_eq!(s.crop, Rect::new(3, 2, 6, 4));
+}
+
 /// Linear sRGB (D65) → XYZ, from the sRGB primaries (IEC 61966-2-1).
 const SRGB_TO_XYZ: [[f64; 3]; 3] = [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]];
 

@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use eframe::wgpu;
-use photocraft_doc::Document;
+use photocraft_doc::{Document, LayerContent};
 use photocraft_engine::Session;
 use photocraft_geom::Rect;
 use serde_json::{Value, json};
@@ -83,6 +83,10 @@ struct Bench {
     /// state later rows need).
     only: Option<String>,
     rows: Vec<(String, f64, f64, f64, f64)>,
+    /// Per row (same order as `rows`): the timed samples and the peak RSS while they ran, for
+    /// `--json` (`cargo xtask perf`).
+    extra: Vec<(Vec<f64>, Option<u64>)>,
+    rss: photocraft_testkit::perf::RssSampler,
 }
 
 impl Bench {
@@ -92,19 +96,24 @@ impl Bench {
         let st = s.active().expect("document");
         let doc = st.doc.clone();
         let region = if full { doc.bounds() } else { st.last_damage.map_or(doc.bounds(), |r| r.inflate(reach(&doc.layers)).intersect(&doc.bounds())) };
+        self.render(&doc, region)
+    }
+
+    /// GPU (or CPU fallback) composite of `region` of `doc`, waited on.
+    fn render(&mut self, doc: &Document, region: Rect) -> f64 {
         if region.is_empty() {
             return 0.0;
         }
         let t = Instant::now();
         match &mut self.gpu {
             Some(g) => {
-                if g.comp.render(&g.device, &g.queue, &doc, region, |_, _| {}).is_err() {
-                    std::hint::black_box(photocraft_compose::render(&doc, region));
+                if g.comp.render(&g.device, &g.queue, doc, region, |_, _| {}).is_err() {
+                    std::hint::black_box(photocraft_compose::render(doc, region));
                 }
                 let _ = g.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
             }
             None => {
-                std::hint::black_box(photocraft_compose::render(&doc, region));
+                std::hint::black_box(photocraft_compose::render(doc, region));
             }
         }
         t.elapsed().as_secs_f64() * 1000.0
@@ -116,8 +125,10 @@ impl Bench {
             f(self);
             return;
         }
+        self.rss.reset();
         let cold = f(self);
         let mut v: Vec<f64> = (0..self.reps).map(|_| f(self)).collect();
+        self.extra.push((v.clone(), self.rss.peak()));
         v.sort_by(f64::total_cmp);
         let med = v[v.len() / 2];
         println!("{name:<44} {med:>9.1} ms   (min {:>8.1}, max {:>8.1}, cold {:>8.1})", v[0], v[v.len() - 1], cold);
@@ -161,7 +172,14 @@ fn main() {
     let (w, h) =
         arg(&args, "--size").and_then(|s| s.split_once('x').map(|(a, b)| (a.parse().unwrap_or(7360), b.parse().unwrap_or(4912)))).unwrap_or((7360, 4912));
     let reps: usize = arg(&args, "--reps").and_then(|v| v.parse().ok()).unwrap_or(5).max(1);
-    let mut b = Bench { gpu: if args.iter().any(|a| a == "--cpu") { None } else { gpu() }, reps, only: arg(&args, "--only"), rows: Vec::new() };
+    let mut b = Bench {
+        gpu: if args.iter().any(|a| a == "--cpu") { None } else { gpu() },
+        reps,
+        only: arg(&args, "--only"),
+        rows: Vec::new(),
+        extra: Vec::new(),
+        rss: photocraft_testkit::perf::RssSampler::start(std::time::Duration::from_millis(2)),
+    };
     println!("document {w}×{h} ({:.1} MP), 8-bit RGB, {} reps, {}", (w * h) as f64 / 1e6, reps, if b.gpu.is_some() { "GPU canvas" } else { "CPU canvas" });
 
     // ---- open / save / export ----------------------------------------------------------------
@@ -218,7 +236,7 @@ fn main() {
 
     // ---- filters / adjustments / layers ------------------------------------------------------
     select(&mut s, 0);
-    for radius in [4.0, 40.0] {
+    for radius in [4.0, 40.0, 250.0] {
         b.time(&format!("Gaussian Blur r {radius} (photo layer) + refresh"), |b| {
             let t = Instant::now();
             exec(&mut s, "filter.blur.gaussianBlur", json!({"radius": radius}));
@@ -227,6 +245,126 @@ fn main() {
             b.refresh(&s, false);
             v
         });
+    }
+    // Filter dialog live preview, per radius change (#464): the command on the proxy plus its
+    // flatten for upload.
+    for radius in [40.0, 250.0] {
+        b.time(&format!("Gaussian Blur dialog preview r {radius}"), |_| {
+            let st = s.active().expect("doc");
+            let k = photocraft_ui_egui::proxy::factor(&st.doc);
+            let t = Instant::now();
+            let p = photocraft_ui_egui::filter_dialog::preview_document(&st.doc, st.active_layer, "filter.blur.gaussianBlur", &json!({"radius": radius}), k)
+                .expect("preview");
+            std::hint::black_box(photocraft_compose::flatten(&p));
+            ms(t)
+        });
+    }
+    // Image › Adjustments dialog preview, per settings change (#77). Before: the command re-run
+    // on a downsampled proxy (plus its flatten for upload). After: the document with a temporary
+    // clipped adjustment layer, recomposited over the target's area by the canvas compositor.
+    for selection in [false, true] {
+        if selection {
+            exec(&mut s, "select.rect", json!({"x": w / 4, "y": h / 4, "width": w / 2, "height": h / 2, "ellipse": true}));
+        }
+        let sel = if selection { ", selection" } else { "" };
+        let mut v = 0;
+        b.time(&format!("Curves dialog change, CPU proxy preview{sel}"), |_| {
+            v = (v + 7) % 120;
+            let st = s.active().expect("doc");
+            let k = photocraft_ui_egui::proxy::factor(&st.doc);
+            let t = Instant::now();
+            let p = photocraft_ui_egui::filter_dialog::preview_document(
+                &st.doc,
+                st.active_layer,
+                "image.adjustments.curves",
+                &json!({"points": [[0, 0], [100, 100 + v], [255, 255]]}),
+                k,
+            )
+            .expect("preview");
+            std::hint::black_box(photocraft_compose::flatten(&p));
+            ms(t)
+        });
+        // Once per dialog session (the app caches both per document revision).
+        let (base, region) = {
+            let st = s.active().expect("doc");
+            let target = st.active_layer.expect("layer");
+            let t = Instant::now();
+            let base = photocraft_ui_egui::adjust_preview::base_document(&st.doc, target).expect("base");
+            let region = photocraft_ui_egui::adjust_preview::region(&st.doc, target);
+            println!("  (layer preview session setup: {:.1} ms, region {region:?})", ms(t));
+            (base, region)
+        };
+        b.time(&format!("Curves dialog change, layer preview{sel}"), |b| {
+            v = (v + 7) % 120;
+            let t = Instant::now();
+            let p =
+                photocraft_ui_egui::adjust_preview::with_settings(&base, "curves", &json!({"points": [[0, 0], [100, 100 + v], [255, 255]]})).expect("preview");
+            let build = ms(t);
+            let t = Instant::now();
+            match &mut b.gpu {
+                Some(g) => {
+                    if g.comp.render(&g.device, &g.queue, &p, region, |_, _| {}).is_err() {
+                        std::hint::black_box(photocraft_compose::render(&p, region));
+                    }
+                    let _ = g.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                }
+                None => {
+                    std::hint::black_box(photocraft_compose::render(&p, region));
+                }
+            }
+            build + ms(t)
+        });
+        // Zoomed in, the canvas composites the region's visible part (here a 2560×1440 view at
+        // 100 %) and catches up elsewhere when the view moves.
+        let view = Rect::from_xywh(w as i32 / 3, h as i32 / 3, 2560, 1440).intersect(&region);
+        b.time(&format!("Curves dialog change, layer preview 100 % view{sel}"), |b| {
+            v = (v + 7) % 120;
+            let t = Instant::now();
+            let p =
+                photocraft_ui_egui::adjust_preview::with_settings(&base, "curves", &json!({"points": [[0, 0], [100, 100 + v], [255, 255]]})).expect("preview");
+            match &mut b.gpu {
+                Some(g) => {
+                    if g.comp.render(&g.device, &g.queue, &p, view, |_, _| {}).is_err() {
+                        std::hint::black_box(photocraft_compose::render(&p, view));
+                    }
+                    let _ = g.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                }
+                None => {
+                    std::hint::black_box(photocraft_compose::render(&p, view));
+                }
+            }
+            ms(t)
+        });
+        // Zoomed out (fit to a 1600-pixel-wide view on a 2× display: k = 2 for 36 MP), the canvas
+        // previews on a reduced copy built once per session.
+        let zoom = 1600.0 / w as f32 * 2.0;
+        let k = photocraft_ui_egui::adjust_preview::proxy_factor(zoom);
+        let t = Instant::now();
+        let proxy = photocraft_ui_egui::adjust_preview::proxy_base(&base, k);
+        println!("  (zoomed-out proxy k {k} setup: {:.1} ms)", ms(t));
+        let kk = k as i32;
+        let pregion = Rect::new(region.x0 / kk, region.y0 / kk, region.x1 / kk + 1, region.y1 / kk + 1).intersect(&proxy.bounds());
+        b.time(&format!("Curves dialog change, layer preview zoomed out{sel}"), |b| {
+            v = (v + 7) % 120;
+            let t = Instant::now();
+            let p = photocraft_ui_egui::adjust_preview::proxy_with_settings(&proxy, "curves", &json!({"points": [[0, 0], [100, 100 + v], [255, 255]]}))
+                .expect("preview");
+            match &mut b.gpu {
+                Some(g) => {
+                    if g.comp.render(&g.device, &g.queue, &p, pregion, |_, _| {}).is_err() {
+                        std::hint::black_box(photocraft_compose::render(&p, pregion));
+                    }
+                    let _ = g.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                }
+                None => {
+                    std::hint::black_box(photocraft_compose::render(&p, pregion));
+                }
+            }
+            ms(t)
+        });
+        if selection {
+            exec(&mut s, "select.deselect", json!({}));
+        }
     }
     exec(&mut s, "layer.newAdjustmentLayer.levels", json!({"inBlack": 10, "inWhite": 240, "gamma": 1.1}));
     let mut g = 1.0;
@@ -291,9 +429,58 @@ fn main() {
         ms(t)
     });
 
+    // ---- live gradient ------------------------------------------------------------------------
+    // A Gradient tool drag in live mode: each pointer move previews a shallow copy of the document
+    // with the edited fill (gradient_ui::display_doc, through gradient_fill_cmds::apply_set) and
+    // recomposites the whole canvas, since the fill covers it. Release commits one command.
+    exec(&mut s, "gradient.fill.create", json!({"from": [w as f32 * 0.2, h as f32 * 0.5], "to": [w as f32 * 0.8, h as f32 * 0.5]}));
+    let gid = s.active().and_then(|st| st.active_layer).expect("gradient layer");
+    let mut k = 0;
+    b.time("live gradient preview doc (no refresh)", |_| {
+        k += 1;
+        let to = [w as f32 * (0.6 + 0.03 * (k % 10) as f32), h as f32 * (0.3 + 0.04 * (k % 7) as f32)];
+        let t = Instant::now();
+        let d = doc(&s);
+        let l = d.layer(gid).expect("layer");
+        let LayerContent::Fill(f) = &l.content else { panic!("not a fill") };
+        let f = photocraft_engine::gradient_fill_cmds::apply_set(l, f, d.bounds(), &json!({"to": to}), [0.0, 0.0, 0.0, 1.0], [1.0; 4]).expect("set");
+        let mut shown = (*d).clone();
+        shown.layer_mut(gid).expect("layer").content = LayerContent::Fill(f);
+        std::hint::black_box(&shown);
+        ms(t)
+    });
+    b.time("live gradient drag update (preview + full refresh)", |b| {
+        k += 1;
+        let to = [w as f32 * (0.6 + 0.03 * (k % 10) as f32), h as f32 * (0.3 + 0.04 * (k % 7) as f32)];
+        let t = Instant::now();
+        let d = doc(&s);
+        let l = d.layer(gid).expect("layer");
+        let LayerContent::Fill(f) = &l.content else { panic!("not a fill") };
+        let f = photocraft_engine::gradient_fill_cmds::apply_set(l, f, d.bounds(), &json!({"to": to}), [0.0, 0.0, 0.0, 1.0], [1.0; 4]).expect("set");
+        let mut shown = (*d).clone();
+        shown.layer_mut(gid).expect("layer").content = LayerContent::Fill(f);
+        ms(t) + b.render(&shown, shown.bounds())
+    });
+    b.time("live gradient release (gradient.fill.set + refresh)", |b| {
+        k += 1;
+        let t = Instant::now();
+        exec(&mut s, "gradient.fill.set", json!({"layer": gid.0, "to": [w as f32 * (0.6 + 0.03 * (k % 10) as f32), h as f32 * 0.4]}));
+        ms(t) + b.refresh(&s, false)
+    });
+
     if let Some(out) = arg(&args, "--json") {
-        let rows: Vec<Value> =
-            b.rows.iter().map(|(n, med, min, max, cold)| json!({"name": n, "median_ms": med, "min_ms": min, "max_ms": max, "cold_ms": cold})).collect();
+        let rows: Vec<Value> = b
+            .rows
+            .iter()
+            .zip(&b.extra)
+            .map(|((n, med, min, max, cold), (samples, rss))| {
+                let mut r = json!({"name": n, "median_ms": med, "min_ms": min, "max_ms": max, "cold_ms": cold});
+                // For `cargo xtask perf`: raw samples (it computes p50 / p95) and peak RSS.
+                r["samples_ms"] = json!(samples);
+                r["peak_rss_bytes"] = json!(rss);
+                r
+            })
+            .collect();
         std::fs::write(&out, serde_json::to_string_pretty(&json!({"width": w, "height": h, "gpu": b.gpu.is_some(), "rows": rows})).unwrap())
             .expect("write json");
     }

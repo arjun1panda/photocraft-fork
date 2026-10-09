@@ -179,8 +179,11 @@ fn write_note(n: &Note) -> Vec<u8> {
     b.push(u8::from(n.open));
     b.push(0x1C);
     b.extend_from_slice(&1u16.to_be_bytes());
+    // The position comes from the file or a command and can sit anywhere in i32 (issue #939):
+    // the cast saturates, and the icon's far edge must saturate too rather than wrap (release) or
+    // overflow (debug) when the note is re-saved.
     let (x, y) = (n.position[0].round() as i32, n.position[1].round() as i32);
-    for v in [y, x, y + 20, x + 16] {
+    for v in [y, x, y.saturating_add(20), x.saturating_add(16)] {
         b.extend_from_slice(&v.to_be_bytes());
     }
     let pp = if n.popup == [0.0; 4] { [n.position[0] + 20.0, n.position[1] + 20.0, n.position[0] + 260.0, n.position[1] + 160.0] } else { n.popup };
@@ -340,17 +343,20 @@ pub fn keep_resource(doc: &Document, id: u16) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "corpus")]
     const SAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../corpus/psd/ag-psd/read-write/annotations/src.psd");
 
+    #[cfg(feature = "corpus")]
     fn anno_of(bytes: &[u8]) -> Option<Vec<u8>> {
         let i = bytes.windows(8).position(|w| w == b"8BIMAnno")?;
         let n = u32::from_be_bytes(bytes[i + 8..i + 12].try_into().ok()?) as usize;
         Some(bytes[i + 12..i + 12 + n].to_vec())
     }
 
+    #[cfg(feature = "corpus")]
     #[test]
     fn parses_and_rewrites_the_sample_byte_exact() {
-        let Ok(file) = std::fs::read(SAMPLE) else { return };
+        let file = std::fs::read(SAMPLE).unwrap_or_else(|e| panic!("{SAMPLE}: {e}: run `cargo xtask corpus --all`"));
         let raw = anno_of(&file).unwrap();
         let notes = parse_anno(&raw).unwrap();
         assert_eq!(notes.len(), 2);

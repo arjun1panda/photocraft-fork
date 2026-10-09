@@ -1,6 +1,7 @@
-//! Font database: bundled fonts (always available, also on the web), optional system fonts found
-//! by scanning the platform font directories (no fontconfig), user-registered font data, and
-//! PostScript-name lookup for PSD import.
+//! Font database: bundled fonts (always available, also on the web), the optional craft-fonts
+//! Japanese fonts ([`crate::craft_fonts`], when built with `CRAFT_FONTS_DIR`), optional system
+//! fonts found by scanning the platform font directories (no fontconfig), user-registered font
+//! data, and PostScript-name lookup for PSD import.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,31 +16,42 @@ pub const DEFAULT_FAMILY: &str = "Inter";
 /// Bundled monospace family.
 pub const MONO_FAMILY: &str = "JetBrains Mono";
 
+// The font files are embedded once, here. The UI (`ui-egui` theme) uses these same statics:
+// a second `include_bytes!` of the same file elsewhere put a second 1.5 MB copy into the wasm.
+pub static INTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+pub static INTER_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/Inter-Medium.ttf");
+pub static INTER_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
+pub static JETBRAINS_MONO_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+
 /// Fonts shipped with Photocraft (OFL; licences in `assets/fonts`).
-pub const BUNDLED: &[(&str, &[u8])] = &[
-    ("Inter-Regular.ttf", include_bytes!("../../../assets/fonts/Inter-Regular.ttf")),
-    ("Inter-Medium.ttf", include_bytes!("../../../assets/fonts/Inter-Medium.ttf")),
-    ("Inter-SemiBold.ttf", include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf")),
-    ("JetBrainsMono-Regular.ttf", include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf")),
+pub static BUNDLED: &[(&str, &[u8])] = &[
+    ("Inter-Regular.ttf", INTER_REGULAR),
+    ("Inter-Medium.ttf", INTER_MEDIUM),
+    ("Inter-SemiBold.ttf", INTER_SEMIBOLD),
+    ("JetBrainsMono-Regular.ttf", JETBRAINS_MONO_REGULAR),
 ];
 
-/// Families tried (if installed) after the requested one, for missing glyphs.
-const FALLBACK_CANDIDATES: &[&str] = &[
-    "Noto Sans",
-    "Arial Unicode MS",
-    "Segoe UI",
-    "DejaVu Sans",
-    "Geeza Pro",
-    "Arial Hebrew",
-    "Noto Sans Arabic",
-    "Noto Sans Hebrew",
-    "Noto Sans CJK SC",
-    "PingFang SC",
-    "Hiragino Sans",
-    "Apple Color Emoji",
-    "Segoe UI Emoji",
-    "Noto Color Emoji",
-];
+/// Families tried (if installed) after the requested one, for missing glyphs. The CJK families
+/// ([`crate::cjk::families`]) go between these two lists, in the UI locale's script order.
+const FALLBACK_CANDIDATES: &[&str] = &["Noto Sans", "Segoe UI", "DejaVu Sans", "Geeza Pro", "Arial Hebrew", "Noto Sans Arabic", "Noto Sans Hebrew"];
+/// Broad-coverage and emoji fonts, tried after the CJK script fonts so shared Han characters get
+/// the locale's forms instead of Arial Unicode's.
+const FALLBACK_LAST: &[&str] = &["Arial Unicode MS", "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"];
+
+/// Every fallback family candidate, CJK ordered for `order` (see [`crate::cjk::script_order`]).
+pub fn fallback_candidates(order: &[crate::cjk::CjkScript; 4]) -> Vec<&'static str> {
+    let mut v = FALLBACK_CANDIDATES.to_vec();
+    for s in order {
+        // craft-fonts' Japanese fonts (if built in) go ahead of the installed Japanese fonts, in
+        // the Japanese slot of the locale order, so shared Han keeps the locale's forms.
+        if *s == crate::cjk::CjkScript::Japanese {
+            v.extend(crate::craft_fonts::japanese_families());
+        }
+        v.extend_from_slice(crate::cjk::families(*s));
+    }
+    v.extend_from_slice(FALLBACK_LAST);
+    v
+}
 
 /// One face in the database (for font menus).
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +101,11 @@ impl FontDb {
         for (_, bytes) in BUNDLED {
             db.register_font_data(bytes.to_vec());
         }
+        // The optional craft-fonts (empty unless built with CRAFT_FONTS_DIR; always empty on
+        // wasm32), before any system font.
+        for f in crate::craft_fonts::CRAFT_FONTS.iter().filter(|f| f.is_japanese()) {
+            db.register_static_font(f.bytes);
+        }
         db.refresh_generics();
         db
     }
@@ -114,6 +131,10 @@ impl FontDb {
             for d in system_font_dirs() {
                 collect_font_files(&d, 0, &mut files);
             }
+            // PingFang (the macOS Chinese UI font) lives outside the font folders.
+            if cfg!(target_os = "macos") {
+                files.extend(crate::cjk::mac_pingfang());
+            }
             for f in files {
                 self.fcx.collection.load_fonts_from_paths([f]);
             }
@@ -124,7 +145,16 @@ impl FontDb {
 
     /// Registers font data (TTF/OTF, or every face of a TTC/OTC). Returns the family names added.
     pub fn register_font_data(&mut self, bytes: Vec<u8>) -> Vec<String> {
-        let added = self.fcx.collection.register_fonts(Blob::new(Arc::new(bytes)), None);
+        self.register_blob(Blob::new(Arc::new(bytes)))
+    }
+
+    /// Registers embedded font data without copying it.
+    fn register_static_font(&mut self, bytes: &'static [u8]) -> Vec<String> {
+        self.register_blob(Blob::new(Arc::new(bytes)))
+    }
+
+    fn register_blob(&mut self, blob: Blob<u8>) -> Vec<String> {
+        let added = self.fcx.collection.register_fonts(blob, None);
         let mut names = Vec::new();
         for (id, _) in added {
             if let Some(n) = self.fcx.collection.family_name(id)
@@ -133,6 +163,10 @@ impl FontDb {
                 names.push(n.to_string());
             }
         }
+        // Deterministic order, user-facing families first: a collection's registration order isn't
+        // stable, and macOS ships private UI faces (".Hiragino Kaku Gothic Interface") whose
+        // metrics differ from the public family's.
+        names.sort_by_key(|n| (is_hidden_family(n), n.to_lowercase()));
         self.ps_cache.clear();
         self.refresh_generics();
         names
@@ -154,7 +188,8 @@ impl FontDb {
                 }
             }
         }
-        self.fallbacks = FALLBACK_CANDIDATES.iter().filter(|f| c.family_id(f).is_some()).map(|s| s.to_string()).collect();
+        let order = crate::cjk::ui_script_order();
+        self.fallbacks = fallback_candidates(&order).into_iter().filter(|f| c.family_id(f).is_some()).map(str::to_string).collect();
     }
 
     /// Families available after the requested one (bundled default + installed coverage fonts).
@@ -164,7 +199,8 @@ impl FontDb {
 
     /// All family names, sorted.
     pub fn families(&mut self) -> Vec<String> {
-        let mut v: Vec<String> = self.fcx.collection.family_names().map(str::to_string).collect();
+        // Private system faces (a leading '.', e.g. macOS ".SF NS") are hidden, as in Photoshop.
+        let mut v: Vec<String> = self.fcx.collection.family_names().filter(|n| !is_hidden_family(n)).map(str::to_string).collect();
         v.sort_by_key(|s| s.to_lowercase());
         v.dedup();
         v
@@ -333,6 +369,10 @@ fn system_font_dirs() -> Vec<std::path::PathBuf> {
     } else {
         v.push(PathBuf::from("/usr/share/fonts"));
         v.push(PathBuf::from("/usr/local/share/fonts"));
+        // Inside a Flatpak sandbox the host's system and per-user fonts are mounted here
+        // (`/usr/share/fonts` is the runtime's own small set). Missing dirs are skipped.
+        v.push(PathBuf::from("/run/host/fonts"));
+        v.push(PathBuf::from("/run/host/user-fonts"));
         if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
             v.push(PathBuf::from(d).join("fonts"));
         }
@@ -342,4 +382,67 @@ fn system_font_dirs() -> Vec<std::path::PathBuf> {
         }
     }
     v
+}
+
+/// A platform-private family (macOS names its UI faces with a leading '.'): never listed or
+/// picked by default.
+pub fn is_hidden_family(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    #[test]
+    fn hidden_families_sort_last_and_are_not_listed() {
+        assert!(super::is_hidden_family(".Hiragino Kaku Gothic Interface"));
+        assert!(!super::is_hidden_family("Hiragino Sans"));
+        let mut v = [".Hiragino Kaku Gothic Interface".to_string(), "Hiragino Kaku Gothic ProN".to_string()];
+        v.sort_by_key(|n| (super::is_hidden_family(n), n.to_lowercase()));
+        assert_eq!(v[0], "Hiragino Kaku Gothic ProN");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn scans_flatpak_host_fonts() {
+        let dirs = super::system_font_dirs();
+        assert!(dirs.iter().any(|d| d.ends_with("run/host/fonts")));
+        assert!(dirs.iter().any(|d| d.ends_with("run/host/user-fonts")));
+    }
+
+    /// The bundled UI fonts cover Czech (the `cs` UI language) on their own: every letter with a
+    /// diacritic and the Czech quotation marks, so no system fallback font is needed.
+    #[test]
+    fn bundled_fonts_cover_czech() {
+        use skrifa::MetadataProvider;
+        let czech = "aábcčdďeéěfghiíjklmnňoópqrřsštťuúůvwxyýzž„“";
+        let letters: String = czech.chars().chain(czech.chars().flat_map(char::to_uppercase)).collect();
+        for (name, bytes) in super::BUNDLED {
+            let font = skrifa::FontRef::new(bytes).expect("bundled font parses");
+            let cmap = font.charmap();
+            let missing: String = letters.chars().filter(|c| cmap.map(*c).is_none_or(|g| g.to_u32() == 0)).collect();
+            assert!(missing.is_empty(), "{name} lacks Czech glyphs: {missing}");
+        }
+    }
+
+    /// The bundled UI fonts cover French (the `fr` UI language) on their own: every accented
+    /// letter, the ligatures, the guillemets and the no-break space used before `: ; ? !`.
+    #[test]
+    fn bundled_fonts_cover_french() {
+        use skrifa::MetadataProvider;
+        let french = "àâæçéèêëîïôœùûüÿ";
+        let letters: String = french.chars().chain(french.chars().flat_map(char::to_uppercase)).chain("«»\u{a0}’".chars()).collect();
+        for (name, bytes) in super::BUNDLED {
+            let font = skrifa::FontRef::new(bytes).expect("bundled font parses");
+            let cmap = font.charmap();
+            let missing: String = letters.chars().filter(|c| cmap.map(*c).is_none_or(|g| g.to_u32() == 0)).collect();
+            assert!(missing.is_empty(), "{name} lacks French glyphs: {missing:?}");
+        }
+    }
+
+    #[test]
+    fn missing_font_dirs_are_skipped() {
+        let mut files = Vec::new();
+        super::collect_font_files(std::path::Path::new("/nonexistent/photocraft/fonts"), 0, &mut files);
+        assert!(files.is_empty());
+    }
 }

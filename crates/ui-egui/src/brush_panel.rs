@@ -1,17 +1,32 @@
-//! Window › Brush Settings (F5): Photoshop's floating brush panel. Section list with enable boxes
-//! on the left, the selected section's controls on the right, and a live stroke preview below.
-//! A second tab lists the brush presets. Edits go straight to the session brush (tool state, like
-//! the options bar); presets are applied through `tools.setBrush`.
-
-use std::sync::Arc;
+//! Window › Brush Settings (F5) and Window › Brushes: Photoshop's floating brush panel.
+//!
+//! Brush Settings: the section list with enable boxes on the left (clicking a name shows and turns
+//! on that section), the selected section's controls on the right (see [`crate::brush_sections`]),
+//! and a live stroke preview strip below, rendered with the real brush engine and cached on the
+//! settings (it re-renders only when they change). Brushes: the presets in collapsible groups with
+//! tip thumbnails and stroke previews, a size slider and a search field.
+//!
+//! The panel never writes the session brush itself: each frame's edits become one
+//! `tools.setBrush` call carrying only the changed fields (Rule 1), so the journal, the control
+//! channel and the MCP server see exactly what the panel did and can do the same. A drag's calls
+//! share a `coalesce` key, so a whole gesture is one journal entry ([`commit_gesture`]).
+//!
+//! The lock beside a section name keeps that section's settings when another preset is picked
+//! (`locks` in the brush, applied by the engine). The Brushes tab lives in [`crate::brushes_tab`].
 
 use egui::{Color32, CornerRadius, RichText, Sense, Stroke, vec2};
 use photocraft_engine::BrushSettings;
-use photocraft_engine::paint::{self, Control, Dynamic, MaskMode, Pattern, PatternStyle, StrokePoint};
-use serde_json::json;
+use photocraft_engine::paint;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 
+use crate::brush_preview;
 use crate::theme::{self, Tokens};
 use crate::{PhotocraftApp, icons, widgets};
+
+pub use crate::brush_preview::{preview_pixels, preview_sig};
+pub use crate::brush_sections::section_body;
+pub use photocraft_engine::brush_cmds::brush_patch;
 
 /// Sections in Photoshop's order. The bool says whether the section has an enable box.
 pub const SECTIONS: [(&str, bool); 13] = [
@@ -30,7 +45,45 @@ pub const SECTIONS: [(&str, bool); 13] = [
     ("Protect Texture", true),
 ];
 
-/// The enable flag behind section `i` (None for Brush Tip Shape).
+/// Panel width and the stroke strip's size.
+pub(crate) const WIDTH: f32 = 540.0;
+const STRIP: (u32, u32) = (488, 76);
+
+/// How the Brushes tab lists presets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrushesView {
+    /// Rows: tip, size, stroke preview, name.
+    #[default]
+    List,
+    /// Tip thumbnails with their sizes.
+    Grid,
+}
+
+/// A rename in progress in the Brushes tab (a preset, or a group when `group` is set).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Renaming {
+    pub group: bool,
+    /// The preset (or group) being renamed.
+    pub name: String,
+    /// The text typed so far.
+    pub text: String,
+}
+
+/// Brushes panel view state (serde, so the control channel can read and drive it).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BrushesPanelState {
+    /// Names of collapsed groups.
+    pub collapsed: Vec<String>,
+    /// Case-insensitive name filter.
+    pub filter: String,
+    pub view: BrushesView,
+    pub renaming: Option<Renaming>,
+}
+
+/// The enable flag behind section `i` (None for Brush Tip Shape and Smoothing).
 pub fn section_flag(b: &mut BrushSettings, i: usize) -> Option<&mut bool> {
     Some(match i {
         1 => &mut b.shape_dynamics.enabled,
@@ -43,324 +96,79 @@ pub fn section_flag(b: &mut BrushSettings, i: usize) -> Option<&mut bool> {
         8 => &mut b.noise,
         9 => &mut b.wet_edges,
         10 => &mut b.build_up,
-        11 => return None,
         12 => &mut b.protect_texture,
         _ => return None,
     })
 }
 
-const CONTROLS: [(Control, &str); 8] = [
-    (Control::Off, "Off"),
-    (Control::Fade, "Fade"),
-    (Control::PenPressure, "Pen Pressure"),
-    (Control::PenTilt, "Pen Tilt"),
-    (Control::StylusWheel, "Stylus Wheel"),
-    (Control::Rotation, "Rotation"),
-    (Control::InitialDirection, "Initial Direction"),
-    (Control::Direction, "Direction"),
-];
+/// The lock behind section `i` (every section but Brush Tip Shape has one, as in Photoshop).
+pub fn section_lock(b: &mut BrushSettings, i: usize) -> Option<&mut bool> {
+    let l = &mut b.locks;
+    Some(match i {
+        1 => &mut l.shape_dynamics,
+        2 => &mut l.scattering,
+        3 => &mut l.texture,
+        4 => &mut l.dual_brush,
+        5 => &mut l.color_dynamics,
+        6 => &mut l.transfer,
+        7 => &mut l.pose,
+        8 => &mut l.noise,
+        9 => &mut l.wet_edges,
+        10 => &mut l.build_up,
+        11 => &mut l.smoothing,
+        12 => &mut l.protect_texture,
+        _ => return None,
+    })
+}
 
-const MASK_MODES: [(MaskMode, &str); 10] = [
-    (MaskMode::Multiply, "Multiply"),
-    (MaskMode::Subtract, "Subtract"),
-    (MaskMode::Darken, "Darken"),
-    (MaskMode::Overlay, "Overlay"),
-    (MaskMode::ColorDodge, "Color Dodge"),
-    (MaskMode::ColorBurn, "Color Burn"),
-    (MaskMode::LinearBurn, "Linear Burn"),
-    (MaskMode::HardMix, "Hard Mix"),
-    (MaskMode::LinearHeight, "Linear Height"),
-    (MaskMode::Height, "Height"),
-];
+/// Send the panel's edits (`before` → `after`) through `tools.setBrush`.
+pub fn commit(app: &mut PhotocraftApp, before: &BrushSettings, after: &BrushSettings) {
+    send(app, before, after, None);
+}
 
-/// Percent slider over a 0..`max` fraction.
-fn pct(ui: &mut egui::Ui, label: &str, v: &mut f32, max: f32) -> bool {
-    let mut p = *v * 100.0;
-    let changed = widgets::slider_row(ui, label, &mut p, 0.0..=max * 100.0, "%", None).changed();
-    if changed {
-        *v = (p / 100.0).clamp(0.0, max);
+fn send(app: &mut PhotocraftApp, before: &BrushSettings, after: &BrushSettings, key: Option<String>) -> bool {
+    if before == after {
+        return false;
     }
-    changed
+    let patch = brush_patch(before, after);
+    if patch.as_object().is_some_and(Map::is_empty) {
+        return false;
+    }
+    let mut p = json!({ "brush": patch });
+    if let Some(k) = key {
+        p["coalesce"] = json!(k);
+    }
+    if let Err(e) = app.run("tools.setBrush", p) {
+        app.ui.status = e;
+    }
+    true
 }
 
-fn num(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str) -> bool {
-    widgets::slider_row(ui, label, v, range, suffix, None).changed()
-}
+const GESTURE: &str = "brush-set-gesture";
 
-/// A jitter slider plus its Control dropdown (and the Fade step count when fading).
-fn dynamic(ui: &mut egui::Ui, id: &str, label: &str, d: &mut Dynamic, max: f32, minimum: Option<&str>) {
-    let t = Tokens::get(ui.ctx());
-    pct(ui, label, &mut d.jitter, max);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Control:").color(t.text_dim));
-        widgets::dropdown(ui, id, &mut d.control, &CONTROLS, 130.0);
-        if d.control == Control::Fade {
-            let mut steps = d.fade_steps as f32;
-            if widgets::value_field(ui, &mut steps, 1.0..=9999.0, "", 52.0).changed() {
-                d.fade_steps = steps.round().clamp(1.0, 9999.0) as u32;
-            }
+/// The current brush-edit gesture number. A pointer press starts a new gesture (once per frame);
+/// [`commit_gesture`] ends one after an edit made with the pointer up (a click, a typed value).
+fn gesture(ctx: &egui::Context) -> u64 {
+    let frame = ctx.cumulative_pass_nr();
+    let pressed = ctx.input(|i| i.pointer.any_pressed());
+    ctx.data_mut(|d| {
+        let g = d.get_temp_mut_or_default::<(u64, u64)>(egui::Id::new(GESTURE));
+        if pressed && g.1 != frame {
+            g.0 += 1;
+            g.1 = frame;
         }
-    });
-    if let Some(m) = minimum {
-        pct(ui, m, &mut d.minimum, 1.0);
-    }
-    ui.add_space(4.0);
+        g.0
+    })
 }
 
-/// Size: a value field over a logarithmic slider (small sizes get most of the travel).
-fn size_row(ui: &mut egui::Ui, label: &str, size: &mut f32, max: f32) {
-    let t = Tokens::get(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(t.text_dim));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            widgets::value_field(ui, size, 1.0..=max, "px", 74.0);
-        });
-    });
-    let mut lv = size.max(1.0).ln();
-    if widgets::slider(ui, &mut lv, 0.0..=max.ln(), None).changed() {
-        *size = lv.exp().round().clamp(1.0, max);
+/// [`commit`] as part of a gesture: every call of one drag carries the same `coalesce` key, so
+/// the engine journals the drag as a single `tools.setBrush` (Rule 1: one command per gesture).
+/// Call it every frame (it tracks presses even when nothing changed).
+pub fn commit_gesture(app: &mut PhotocraftApp, ctx: &egui::Context, before: &BrushSettings, after: &BrushSettings) {
+    let g = gesture(ctx);
+    if send(app, before, after, Some(format!("brush-ui:{g}"))) && !ctx.input(|i| i.pointer.any_down()) {
+        ctx.data_mut(|d| d.get_temp_mut_or_default::<(u64, u64)>(egui::Id::new(GESTURE)).0 += 1);
     }
-    ui.add_space(4.0);
-}
-
-fn tip_shape(ui: &mut egui::Ui, b: &mut BrushSettings) {
-    size_row(ui, "Size", &mut b.size, 5000.0);
-    ui.horizontal(|ui| {
-        widgets::checkbox(ui, &mut b.flip_x, "Flip X");
-        widgets::checkbox(ui, &mut b.flip_y, "Flip Y");
-    });
-    num(ui, "Angle", &mut b.angle, -180.0..=180.0, "°");
-    pct(ui, "Roundness", &mut b.roundness, 1.0);
-    if matches!(b.tip, paint::TipShape::Round) {
-        pct(ui, "Hardness", &mut b.hardness, 1.0);
-    }
-    let mut spacing_on = b.spacing > 0.0;
-    widgets::checkbox(ui, &mut spacing_on, "Spacing");
-    if spacing_on {
-        pct(ui, "Spacing", &mut b.spacing, 10.0);
-        b.spacing = b.spacing.max(0.01);
-    }
-}
-
-fn texture(ui: &mut egui::Ui, b: &mut BrushSettings) {
-    let tx = &mut b.texture;
-    let t = Tokens::get(ui.ctx());
-    if let Pattern::Procedural { style, size, .. } = &mut tx.pattern {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Pattern").color(t.text_dim));
-            let opts = [(PatternStyle::Paper, "Paper"), (PatternStyle::Canvas, "Canvas"), (PatternStyle::Noise, "Noise"), (PatternStyle::Dots, "Dots")];
-            widgets::dropdown(ui, "brush-pattern", style, &opts, 110.0);
-        });
-        let mut s = *size as f32;
-        if num(ui, "Pattern Size", &mut s, 16.0..=1024.0, "px") {
-            *size = s.round() as u32;
-        }
-    } else {
-        ui.label(RichText::new("Custom pattern").color(t.text_faint));
-    }
-    widgets::checkbox(ui, &mut tx.invert, "Invert");
-    pct(ui, "Scale", &mut tx.scale, 10.0);
-    let mut br = tx.brightness * 150.0;
-    if num(ui, "Brightness", &mut br, -150.0..=150.0, "") {
-        tx.brightness = br / 150.0;
-    }
-    let mut ct = tx.contrast * 50.0;
-    if num(ui, "Contrast", &mut ct, -50.0..=100.0, "") {
-        tx.contrast = ct / 50.0;
-    }
-    widgets::checkbox(ui, &mut tx.each_tip, "Texture Each Tip");
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Mode").color(t.text_dim));
-        widgets::dropdown(ui, "brush-texture-mode", &mut tx.mode, &MASK_MODES, 130.0);
-    });
-    pct(ui, "Depth", &mut tx.depth, 1.0);
-    if tx.each_tip {
-        dynamic(ui, "brush-depth-ctl", "Depth Jitter", &mut tx.depth_jitter, 1.0, Some("Minimum Depth"));
-    }
-}
-
-fn dual_brush(ui: &mut egui::Ui, b: &mut BrushSettings) {
-    let t = Tokens::get(ui.ctx());
-    let d = &mut b.dual_brush;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Mode").color(t.text_dim));
-        widgets::dropdown(ui, "brush-dual-mode", &mut d.mode, &MASK_MODES, 130.0);
-        widgets::checkbox(ui, &mut d.flip, "Flip");
-    });
-    size_row(ui, "Size", &mut d.size, 2500.0);
-    pct(ui, "Hardness", &mut d.hardness, 1.0);
-    pct(ui, "Spacing", &mut d.spacing, 10.0);
-    pct(ui, "Scatter", &mut d.scatter, 10.0);
-    widgets::checkbox(ui, &mut d.both_axes, "Both Axes");
-    let mut c = d.count as f32;
-    if num(ui, "Count", &mut c, 1.0..=16.0, "") {
-        d.count = c.round() as u32;
-    }
-}
-
-fn color_dynamics(ui: &mut egui::Ui, b: &mut BrushSettings) {
-    let c = &mut b.color_dynamics;
-    widgets::checkbox(ui, &mut c.per_tip, "Apply Per Tip");
-    dynamic(ui, "brush-fgbg-ctl", "Foreground/Background Jitter", &mut c.fg_bg, 1.0, None);
-    pct(ui, "Hue Jitter", &mut c.hue_jitter, 1.0);
-    pct(ui, "Saturation Jitter", &mut c.saturation_jitter, 1.0);
-    pct(ui, "Brightness Jitter", &mut c.brightness_jitter, 1.0);
-    let mut p = c.purity * 100.0;
-    if num(ui, "Purity", &mut p, -100.0..=100.0, "%") {
-        c.purity = p / 100.0;
-    }
-}
-
-fn pose(ui: &mut egui::Ui, b: &mut BrushSettings) {
-    let p = &mut b.pose;
-    let mut tx = p.tilt_x * 100.0;
-    if num(ui, "Tilt X", &mut tx, -100.0..=100.0, "%") {
-        p.tilt_x = tx / 100.0;
-    }
-    let mut ty = p.tilt_y * 100.0;
-    if num(ui, "Tilt Y", &mut ty, -100.0..=100.0, "%") {
-        p.tilt_y = ty / 100.0;
-    }
-    widgets::checkbox(ui, &mut p.override_tilt, "Override Tilt");
-    num(ui, "Rotation", &mut p.rotation, 0.0..=360.0, "°");
-    widgets::checkbox(ui, &mut p.override_rotation, "Override Rotation");
-    pct(ui, "Pressure", &mut p.pressure, 1.0);
-    widgets::checkbox(ui, &mut p.override_pressure, "Override Pressure");
-}
-
-fn smoothing(ui: &mut egui::Ui, b: &mut BrushSettings) {
-    let s = &mut b.smoothing;
-    pct(ui, "Smoothing", &mut s.amount, 1.0);
-    widgets::checkbox(ui, &mut s.pulled_string, "Pulled String Mode");
-    widgets::checkbox(ui, &mut s.catch_up, "Stroke Catch-up");
-    widgets::checkbox(ui, &mut s.catch_up_on_end, "Catch-up on Stroke End");
-    widgets::checkbox(ui, &mut s.adjust_for_zoom, "Adjust for Zoom");
-}
-
-/// Controls for section `i`.
-pub fn section_body(ui: &mut egui::Ui, b: &mut BrushSettings, i: usize) {
-    let t = Tokens::get(ui.ctx());
-    let note = |ui: &mut egui::Ui, s: &str| {
-        ui.label(RichText::new(s).color(t.text_faint));
-    };
-    match i {
-        0 => tip_shape(ui, b),
-        1 => {
-            let sd = &mut b.shape_dynamics;
-            dynamic(ui, "brush-size-ctl", "Size Jitter", &mut sd.size, 1.0, Some("Minimum Diameter"));
-            dynamic(ui, "brush-angle-ctl", "Angle Jitter", &mut sd.angle, 1.0, None);
-            dynamic(ui, "brush-round-ctl", "Roundness Jitter", &mut sd.roundness, 1.0, Some("Minimum Roundness"));
-            widgets::checkbox(ui, &mut sd.flip_x_jitter, "Flip X Jitter");
-            widgets::checkbox(ui, &mut sd.flip_y_jitter, "Flip Y Jitter");
-        }
-        2 => {
-            let sc = &mut b.scattering;
-            widgets::checkbox(ui, &mut sc.both_axes, "Both Axes");
-            dynamic(ui, "brush-scatter-ctl", "Scatter", &mut sc.scatter, 10.0, None);
-            let mut c = sc.count as f32;
-            if num(ui, "Count", &mut c, 1.0..=16.0, "") {
-                sc.count = c.round() as u32;
-            }
-            dynamic(ui, "brush-count-ctl", "Count Jitter", &mut sc.count_jitter, 1.0, None);
-        }
-        3 => texture(ui, b),
-        4 => dual_brush(ui, b),
-        5 => color_dynamics(ui, b),
-        6 => {
-            let tr = &mut b.transfer;
-            dynamic(ui, "brush-opacity-ctl", "Opacity Jitter", &mut tr.opacity, 1.0, Some("Minimum"));
-            dynamic(ui, "brush-flow-ctl", "Flow Jitter", &mut tr.flow, 1.0, Some("Minimum"));
-        }
-        7 => pose(ui, b),
-        8 => note(ui, "Adds grain to the soft edges of the brush tip."),
-        9 => note(ui, "Watercolour look: lighter interior, darker rims."),
-        10 => {
-            note(ui, "Airbrush: keeps painting while the pointer rests.");
-            num(ui, "Rate", &mut b.build_up_rate, 1.0..=200.0, "/s");
-        }
-        11 => smoothing(ui, b),
-        _ => note(ui, "Keeps the current texture when switching presets."),
-    }
-}
-
-/// A stroke rendered with the brush (scaled down to fit), as RGBA8, for previews and preset rows.
-pub fn preview_pixels(b: &BrushSettings, w: u32, h: u32, color: [f32; 4]) -> Vec<u8> {
-    use photocraft_color::{ColorMode, PixelFormat, SampleType};
-    let mut brush = b.clone();
-    let k = ((h as f32 * 0.55) / brush.size.max(1.0)).min(1.0);
-    brush.size = (brush.size * k).max(1.0);
-    brush.dual_brush.size = (brush.dual_brush.size * k).max(1.0);
-    brush.color = color;
-    brush.erase = false;
-    brush.seed = 7;
-    // Photoshop's preview: an S-curve with pressure tapering in and out.
-    let n = 64;
-    let points: Vec<StrokePoint> = (0..=n)
-        .map(|i| {
-            let s = i as f64 / n as f64;
-            let x = 10.0 + s * (w as f64 - 20.0);
-            let y = h as f64 / 2.0 - (s * std::f64::consts::TAU).sin() * h as f64 * 0.22;
-            StrokePoint::new(x, y, (s * std::f64::consts::PI).sin().max(0.05) as f32)
-        })
-        .collect();
-    let fmt = PixelFormat::new(ColorMode::Rgb, SampleType::U8, true);
-    let mut s = photocraft_raster::Surface::new(fmt);
-    paint::apply_stroke(&mut s, &paint::Stroke { brush, points }, None, false);
-    let r = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
-    let mut px = vec![[0.0f32; 4]; (w * h) as usize];
-    s.read_rgba_into(r, &mut px);
-    px.iter().flat_map(|p| p.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)).collect()
-}
-
-/// Cheap signature of everything that changes a brush's preview. Sampled tips and pattern tiles
-/// contribute their size and a strided sample instead of every pixel, so imported presets with
-/// big tips don't serialise megabytes per frame.
-pub fn preview_sig(b: &BrushSettings) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    fn js<T: serde::Serialize>(h: &mut DefaultHasher, v: &T) {
-        serde_json::to_vec(v).unwrap_or_default().hash(h);
-    }
-    fn tile(h: &mut DefaultHasher, t: &paint::GrayTile) {
-        (t.width, t.height).hash(h);
-        let step = (t.data.len() / 4096).max(1);
-        t.data.iter().step_by(step).for_each(|v| v.hash(h));
-    }
-    fn tip(h: &mut DefaultHasher, t: &paint::TipShape) {
-        match t {
-            paint::TipShape::Round => 0u8.hash(h),
-            paint::TipShape::Sampled(g) => tile(h, g),
-        }
-    }
-    let mut h = DefaultHasher::new();
-    js(&mut h, &(b.size, b.hardness, b.spacing, b.opacity, b.flow, b.pressure_size, b.pressure_opacity, b.erase, b.mode, b.angle, b.roundness));
-    js(&mut h, &(b.flip_x, b.flip_y, b.aliased, b.noise, b.wet_edges, b.build_up, b.build_up_rate, b.protect_texture, b.seed));
-    js(&mut h, &(&b.shape_dynamics, &b.scattering, &b.color_dynamics, &b.transfer, &b.pose, &b.smoothing));
-    tip(&mut h, &b.tip);
-    let d = &b.dual_brush;
-    js(&mut h, &(d.enabled, d.mode, d.size, d.hardness, d.roundness, d.angle, d.spacing, d.scatter, d.both_axes, d.count, d.flip));
-    tip(&mut h, &d.tip);
-    let t = &b.texture;
-    js(&mut h, &(t.enabled, t.invert, t.scale, t.brightness, t.contrast, t.each_tip, t.mode, t.depth, t.depth_jitter));
-    match &t.pattern {
-        Pattern::Tile(g) => tile(&mut h, g),
-        p => js(&mut h, p),
-    }
-    h.finish()
-}
-
-/// Texture for a brush preview, cached on [`preview_sig`].
-fn preview_texture(ui: &egui::Ui, b: &BrushSettings, w: u32, h: u32, color: Color32) -> Arc<egui::TextureHandle> {
-    let id = egui::Id::new(("brush-preview", preview_sig(b), w, h, color));
-    if let Some(tex) = ui.data(|d| d.get_temp::<Arc<egui::TextureHandle>>(id)) {
-        return tex;
-    }
-    let c = color.to_normalized_gamma_f32();
-    let px = preview_pixels(b, w, h, [c[0], c[1], c[2], 1.0]);
-    let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px);
-    let tex = Arc::new(ui.ctx().load_texture("brush-preview", img, egui::TextureOptions::LINEAR));
-    ui.data_mut(|d| d.insert_temp(id, tex.clone()));
-    tex
 }
 
 /// Group label for presets saved without a group.
@@ -379,65 +187,156 @@ pub fn grouped_presets(presets: &[paint::BrushPreset]) -> Vec<(String, Vec<usize
     out
 }
 
-fn presets_tab(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+/// Does the current brush match `preset` (everything but colour, size and the tool state that
+/// picking a preset keeps: smoothing and the section locks)? Cheap fields first: the full
+/// comparison clones the preset and its tip.
+pub fn is_current(preset: &BrushSettings, brush: &BrushSettings) -> bool {
+    preset.hardness == brush.hardness
+        && preset.spacing == brush.spacing
+        && preset.tip == brush.tip
+        && BrushSettings {
+            color: brush.color,
+            size: brush.size,
+            background: brush.background,
+            smoothing: brush.smoothing.clone(),
+            locks: brush.locks.clone(),
+            ..preset.clone()
+        } == *brush
+}
+
+/// A fresh "Brush N" name.
+pub(crate) fn new_preset_name(presets: &[paint::BrushPreset]) -> String {
+    (1..).map(|n| format!("Brush {n}")).find(|n| !presets.iter().any(|p| &p.name == n)).unwrap_or_else(|| "Brush".into())
+}
+
+pub(crate) fn run_or_status(app: &mut PhotocraftApp, id: &str, p: Value) {
+    if let Err(e) = app.run(id, p) {
+        app.ui.status = e;
+    }
+}
+
+pub(crate) fn full_uv() -> egui::Rect {
+    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+}
+
+/// The section list: enable boxes, names, locks, the selection. Clicking a name shows the section
+/// and turns it on (Photoshop); clicking a box only toggles it; the lock on the right keeps the
+/// section when another preset is picked.
+fn section_list(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mut BrushSettings) {
     let t = Tokens::get(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{} presets", app.session.tools.presets.len())).color(t.text_faint));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Import Brushes…").on_hover_text("Load Photoshop brushes (.abr)").clicked() {
-                app.open_dialog_file();
+    ui.vertical(|ui| {
+        ui.set_width(150.0);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for (i, (name, has_box)) in SECTIONS.iter().enumerate() {
+            let sel = app.ui.brush_section == i;
+            let (r, resp) = ui.allocate_exact_size(vec2(150.0, 23.0), Sense::click());
+            // Named for accessibility and for tests and agents that look sections up by name.
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, sel, tl!(*name)));
+            if sel {
+                ui.painter().rect_filled(r, t.radius_sm, t.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(r, t.radius_sm, t.hover);
             }
-        });
-    });
-    ui.add_space(4.0);
-    let groups = grouped_presets(&app.session.tools.presets);
-    // The current brush matches a preset when everything but its colour and size agrees.
-    // Cheap fields first: the full comparison clones the preset (and its tip).
-    let same = |a: &BrushSettings, b: &BrushSettings| {
-        a.hardness == b.hardness
-            && a.spacing == b.spacing
-            && a.tip == b.tip
-            && BrushSettings { color: b.color, size: b.size, background: b.background, ..a.clone() } == *b
-    };
-    let brush = &app.session.tools.brush;
-    let mut clicked = None;
-    egui::ScrollArea::vertical().id_salt("brush-presets").max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
-        for (group, items) in groups {
-            ui.add_space(4.0);
-            ui.label(RichText::new(&group).font(theme::semibold(12.0)).color(t.text));
-            ui.add_space(2.0);
-            for i in items {
-                let Some(p) = app.session.tools.presets.get(i) else { continue };
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
-                if !ui.is_rect_visible(r) {
-                    continue;
+            let mut x = r.left() + 6.0;
+            if *has_box && let Some(flag) = section_flag(b, i) {
+                let br = egui::Rect::from_center_size(egui::pos2(x + 6.0, r.center().y), vec2(13.0, 13.0));
+                let box_resp = ui.interact(br, ui.id().with(("brush-sec-box", i)), Sense::click());
+                let checked = *flag;
+                box_resp.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, checked, crate::i18n::fmt(tl!("Enable {name}"), &[("name", tl!(*name))]))
+                });
+                if *flag {
+                    ui.painter().rect_filled(br, 2.0, t.accent);
+                    let (a, m, c) = (br.left_center() + vec2(3.0, 0.5), br.center_bottom() + vec2(-1.0, -3.5), br.right_top() + vec2(-3.0, 3.5));
+                    ui.painter().line_segment([a, m], Stroke::new(1.6, Color32::WHITE));
+                    ui.painter().line_segment([m, c], Stroke::new(1.6, Color32::WHITE));
+                } else {
+                    ui.painter().rect_stroke(br, 2.0, Stroke::new(1.2, t.text_faint), egui::StrokeKind::Inside);
                 }
-                if same(&p.brush, brush) {
-                    ui.painter().rect_filled(r, t.radius_sm, t.accent_soft);
-                } else if resp.hovered() {
-                    ui.painter().rect_filled(r, t.radius_sm, t.hover);
+                let on_lock = resp.interact_pointer_pos().is_some_and(|p| p.x > r.right() - 22.0);
+                if box_resp.clicked() {
+                    *flag = !*flag;
+                } else if resp.clicked() && !on_lock {
+                    *flag = true;
                 }
-                let tex = preview_texture(ui, &p.brush, 180, 36, t.text);
-                let ir = egui::Rect::from_min_size(r.left_top() + vec2(4.0, 2.0), vec2(180.0, 36.0));
-                ui.painter().image(tex.id(), ir, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
-                ui.painter().text(
-                    egui::pos2(ir.right() + 10.0, r.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &p.name,
-                    egui::FontId::proportional(12.0),
-                    t.text_dim,
-                );
-                if resp.clicked() {
-                    clicked = Some(p.name.clone());
+                x += 20.0;
+            } else if i > 0 {
+                x += 20.0;
+            }
+            let color = if sel { t.text } else { t.text_dim };
+            let font = if i == 0 { theme::semibold(12.0) } else { theme::medium(12.0) };
+            let mut job = egui::text::LayoutJob::simple_singleline(tl!(name).to_string(), font, color);
+            job.wrap = egui::text::TextWrapping::truncate_at_width((r.right() - 22.0 - x).max(0.0));
+            let galley = ui.painter().layout_job(job);
+            let elided = galley.elided;
+            ui.painter().galley(egui::pos2(x, r.center().y - galley.size().y / 2.0), galley, color);
+            let resp = if elided { resp.on_hover_text(tl!(name)) } else { resp };
+            let mut lock_clicked = false;
+            if let Some(lock) = section_lock(b, i) {
+                let lr = egui::Rect::from_center_size(egui::pos2(r.right() - 11.0, r.center().y), vec2(18.0, 18.0));
+                let lresp = ui.interact(lr, ui.id().with(("brush-sec-lock", i)), Sense::click());
+                // Like Photoshop: the lock shows only when set or hovered.
+                if *lock || resp.hovered() || lresp.hovered() {
+                    let tint = if *lock { t.text } else { t.text_faint };
+                    icons::paint(ui, lr, if *lock { "lock" } else { "lock-open" }, 12.0, tint);
                 }
+                let tip =
+                    if *lock { tl!("Unlock: picking a preset replaces these settings") } else { tl!("Lock: keep these settings when picking another preset") };
+                if lresp.on_hover_text(tip).clicked() {
+                    *lock = !*lock;
+                    lock_clicked = true;
+                }
+            }
+            if resp.clicked() && !lock_clicked {
+                app.ui.brush_section = i;
+            }
+            if i == 0 {
+                ui.add_space(4.0);
             }
         }
     });
-    if let Some(name) = clicked
-        && let Err(e) = app.session.execute("tools.setBrush", json!({"preset": name}))
-    {
-        app.ui.status = e.to_string();
-    }
+}
+
+fn settings_tab(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
+    let before = app.session.tools.brush.clone();
+    let mut b = before.clone();
+    let section = app.ui.brush_section.min(SECTIONS.len() - 1);
+    ui.horizontal_top(|ui| {
+        section_list(app, ui, &mut b);
+        widgets::vline(ui, 482.0);
+        ui.vertical(|ui| {
+            ui.set_width(WIDTH - 190.0);
+            let name = SECTIONS.get(section).map_or("Brush Tip Shape", |entry| entry.0);
+            ui.label(RichText::new(tl!(name)).font(theme::semibold(12.5)).color(t.text));
+            ui.add_space(6.0);
+            let on = section_flag(&mut b, section).is_none_or(|f| *f);
+            egui::ScrollArea::vertical().id_salt(("brush-section", section)).max_height(450.0).auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(WIDTH - 204.0);
+                // A section that's off shows its options greyed out (Photoshop).
+                ui.add_enabled_ui(on, |ui| section_body(ui, &mut b, section, &app.session.tools.presets));
+            });
+        });
+    });
+    ui.add_space(6.0);
+    widgets::hairline(ui);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(STRIP.0 as f32, STRIP.1 as f32), Sense::hover());
+        ui.painter().rect_filled(r, t.radius_sm, t.field);
+        let tex = brush_preview::stroke_texture(ui.ctx(), "settings-strip", &b, STRIP.0, STRIP.1, t.text);
+        ui.painter().image(tex.id(), r, full_uv(), Color32::WHITE);
+        ui.vertical(|ui| {
+            if icons::button(ui, "square-plus", 24.0, false, tl!("Create new brush from these settings")).clicked() {
+                let name = new_preset_name(&app.session.tools.presets);
+                run_or_status(app, "brush.presets.save", json!({ "name": name, "brush": serde_json::to_value(&b).unwrap_or(Value::Null) }));
+            }
+            if icons::button(ui, "undo-2", 24.0, false, tl!("Reset the brush to the defaults")).clicked() {
+                b = BrushSettings { color: b.color, background: b.background, smoothing: b.smoothing.clone(), locks: b.locks.clone(), ..Default::default() };
+            }
+        });
+    });
+    commit_gesture(app, ui.ctx(), &before, &b);
 }
 
 pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
@@ -453,24 +352,24 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .inner_margin(egui::Margin::same(10));
     let canvas = app.last_canvas_rect;
     let mut open = true;
-    egui::Window::new("Brush Settings")
+    egui::Window::new(tl!("Brush Settings"))
         .id(egui::Id::new("brush-settings"))
         .title_bar(false)
         .resizable(false)
         .frame(frame)
-        .default_pos(egui::pos2((canvas.right() - 500.0).max(canvas.left() + 8.0), canvas.top() + 40.0))
+        .default_pos(egui::pos2((canvas.right() - WIDTH - 30.0).max(canvas.left() + 8.0), canvas.top() + 24.0))
         .show(ctx, |ui| {
-            ui.set_width(470.0);
+            ui.set_width(WIDTH);
             ui.horizontal(|ui| {
                 let mut tab = app.ui.brush_tab;
-                for (i, name) in ["Brush Settings", "Brushes"].iter().enumerate() {
+                for (i, name) in [tl!("Brush Settings"), tl!("Brushes")].iter().enumerate() {
                     if widgets::pill_tab(ui, name, tab == i).clicked() {
                         tab = i;
                     }
                 }
                 app.ui.brush_tab = tab;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::button(ui, "x", 20.0, false, "Close").clicked() {
+                    if icons::button(ui, "x", 20.0, false, tl!("Close")).clicked() {
                         open = false;
                     }
                 });
@@ -479,65 +378,9 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
             widgets::hairline(ui);
             ui.add_space(6.0);
             if app.ui.brush_tab == 1 {
-                presets_tab(app, ui);
-                return;
-            }
-            let mut b = app.session.tools.brush.clone();
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(150.0);
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    for (i, (name, has_box)) in SECTIONS.iter().enumerate() {
-                        let sel = app.ui.brush_section == i;
-                        let (r, resp) = ui.allocate_exact_size(vec2(150.0, 21.0), Sense::click());
-                        if sel {
-                            ui.painter().rect_filled(r, t.radius_sm, t.accent_soft);
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(r, t.radius_sm, t.hover);
-                        }
-                        let mut x = r.left() + 6.0;
-                        if *has_box && let Some(flag) = section_flag(&mut b, i) {
-                            let br = egui::Rect::from_center_size(egui::pos2(x + 6.0, r.center().y), vec2(12.0, 12.0));
-                            let box_resp = ui.interact(br, ui.id().with(("brush-sec-box", i)), Sense::click());
-                            if *flag {
-                                ui.painter().rect_filled(br, 2.0, t.accent);
-                                ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, "✓", egui::FontId::proportional(10.0), Color32::WHITE);
-                            } else {
-                                ui.painter().rect_stroke(br, 2.0, Stroke::new(1.2, t.text_faint), egui::StrokeKind::Inside);
-                            }
-                            if box_resp.clicked() {
-                                *flag = !*flag;
-                            }
-                            x += 18.0;
-                        } else if i > 0 {
-                            x += 18.0;
-                        }
-                        let color = if sel { t.text } else { t.text_dim };
-                        ui.painter().text(egui::pos2(x, r.center().y), egui::Align2::LEFT_CENTER, *name, theme::medium(12.0), color);
-                        if resp.clicked() {
-                            app.ui.brush_section = i;
-                        }
-                    }
-                });
-                widgets::vline(ui, 350.0);
-                ui.vertical(|ui| {
-                    ui.set_width(290.0);
-                    ui.label(RichText::new(SECTIONS[app.ui.brush_section.min(SECTIONS.len() - 1)].0).font(theme::semibold(12.5)).color(t.text));
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical().id_salt("brush-section").max_height(330.0).auto_shrink([false, true]).show(ui, |ui| {
-                        section_body(ui, &mut b, app.ui.brush_section);
-                    });
-                });
-            });
-            ui.add_space(6.0);
-            widgets::hairline(ui);
-            ui.add_space(6.0);
-            let tex = preview_texture(ui, &b, 450, 72, t.text);
-            let (r, _) = ui.allocate_exact_size(vec2(450.0, 72.0), Sense::hover());
-            ui.painter().rect_filled(r, t.radius_sm, t.field);
-            ui.painter().image(tex.id(), r, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
-            if b != app.session.tools.brush {
-                app.session.tools.brush = b;
+                crate::brushes_tab::show(app, ui);
+            } else {
+                settings_tab(app, ui);
             }
         });
     if !open {
@@ -546,29 +389,5 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sections_with_boxes_have_flags() {
-        let mut b = BrushSettings::default();
-        for (i, (_, has_box)) in SECTIONS.iter().enumerate() {
-            assert_eq!(section_flag(&mut b, i).is_some(), *has_box, "{i}");
-        }
-        *section_flag(&mut b, 3).unwrap() = true;
-        assert!(b.texture.enabled);
-    }
-
-    #[test]
-    fn preview_draws_a_stroke_that_fits() {
-        let mut b = BrushSettings { size: 400.0, ..Default::default() };
-        let px = preview_pixels(&b, 120, 40, [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(px.len(), 120 * 40 * 4);
-        let covered = px.as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count();
-        assert!(covered > 200 && covered < 120 * 40 / 2, "{covered}");
-        // Dynamics change the preview.
-        b.scattering.enabled = true;
-        b.scattering.scatter.jitter = 3.0;
-        assert_ne!(preview_pixels(&b, 120, 40, [1.0, 0.0, 0.0, 1.0]), px);
-    }
-}
+#[path = "brush_panel_tests.rs"]
+mod tests;

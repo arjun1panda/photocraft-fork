@@ -52,8 +52,12 @@ fn map_angle(a: &Affine, deg: f32) -> f32 {
 }
 
 fn map_fill(a: &Affine, f: &mut Fill) {
-    if let Fill::Gradient { angle, .. } = f {
+    if let Fill::Gradient { angle, offset, .. } = f {
         *angle = map_angle(a, *angle);
+        // The centre offset (a fraction of the frame) turns with the canvas: exact for 90° turns
+        // and flips, where the frame's sides swap with the axes.
+        let (ox, oy) = (f64::from(offset.0), f64::from(offset.1));
+        *offset = ((a.m[0] * ox + a.m[2] * oy) as f32, (a.m[1] * ox + a.m[3] * oy) as f32);
     }
 }
 
@@ -100,7 +104,7 @@ pub(crate) fn transform_layer_geometry(l: &mut Layer, a: &Affine, content: bool,
             t.transform = a.mul(&t.transform);
             retag_text(dpi, t);
         }
-        LayerContent::Smart(sm) if content => sm.transform = crate::smart_cmds::snap_affine(a.mul(&sm.transform)),
+        LayerContent::Smart(sm) if content => crate::smart_cmds::transform_placement(sm, a),
         LayerContent::Group(g) => {
             if let Some(ab) = &mut g.artboard {
                 ab.rect = map_rect(a, ab.rect);

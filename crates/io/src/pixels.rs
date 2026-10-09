@@ -41,26 +41,38 @@ fn invert_sample(bytes: &mut [u8], s: SampleType) {
 pub fn interleave(planes: &[Option<&[u8]>], fill: &[Vec<u8>], n: usize, s: SampleType, invert: &[bool]) -> Vec<u8> {
     let bps = s.bytes();
     let ch = planes.len();
-    let mut out = vec![0u8; n * ch * bps];
-    for (c, plane) in planes.iter().enumerate() {
-        for i in 0..n {
-            let dst = &mut out[(i * ch + c) * bps..(i * ch + c + 1) * bps];
-            match plane {
-                Some(p) if p.len() >= (i + 1) * bps => {
-                    let src = &p[i * bps..(i + 1) * bps];
-                    for k in 0..bps {
-                        dst[k] = src[bps - 1 - k];
+    let row = ch * bps;
+    let mut out = vec![0u8; n * row];
+    // One band of rows per core, written straight into its slice of the shared output: the
+    // per-pixel channel loop stays, but a band holds ~1/cores of a 20 MP image's iterations
+    // instead of all of them.
+    let bs = bands(n);
+    let parts: Vec<Vec<u8>> = par_map(bs.clone(), |band| {
+        let mut part = vec![0u8; band.len() * row];
+        for (i, p) in band.clone().enumerate() {
+            for (c, plane) in planes.iter().enumerate() {
+                let dst = &mut part[(i * ch + c) * bps..(i * ch + c + 1) * bps];
+                match plane {
+                    Some(pl) if pl.len() >= (p + 1) * bps => {
+                        let src = &pl[p * bps..(p + 1) * bps];
+                        for k in 0..bps {
+                            dst[k] = src[bps - 1 - k];
+                        }
+                        if cfg!(target_endian = "big") {
+                            dst.copy_from_slice(src);
+                        }
+                        if invert[c] {
+                            invert_sample(dst, s);
+                        }
                     }
-                    if cfg!(target_endian = "big") {
-                        dst.copy_from_slice(src);
-                    }
-                    if invert[c] {
-                        invert_sample(dst, s);
-                    }
+                    _ => dst.copy_from_slice(&fill[c]),
                 }
-                _ => dst.copy_from_slice(&fill[c]),
             }
         }
+        part
+    });
+    for (band, part) in bs.into_iter().zip(parts) {
+        out[band.start * row..band.end * row].copy_from_slice(&part);
     }
     out
 }
@@ -76,20 +88,32 @@ pub fn deinterleave(bytes: &[u8], ch: usize, s: SampleType, invert: &[bool]) -> 
             if invert[c] { it.map(|v| 255 - v).collect() } else { it.copied().collect() }
         });
     }
-    let mut planes = vec![Vec::with_capacity(n * bps); ch];
-    let mut tmp = [0u8; 4];
-    for i in 0..n {
+    // One band of rows per core, appended in band order into pre-grown planes.
+    let row = ch * bps;
+    let bs = bands(n);
+    let parts: Vec<Vec<Vec<u8>>> = par_map(bs.clone(), |band| {
+        let mut planes = vec![Vec::with_capacity(band.len() * bps); ch];
+        let mut tmp = [0u8; 4];
+        for p in band {
+            for (c, plane) in planes.iter_mut().enumerate() {
+                let src = &bytes[p * row + c * bps..p * row + (c + 1) * bps];
+                tmp[..bps].copy_from_slice(src);
+                if invert[c] {
+                    invert_sample(&mut tmp[..bps], s);
+                }
+                if cfg!(target_endian = "big") {
+                    plane.extend_from_slice(&tmp[..bps]);
+                } else {
+                    plane.extend(tmp[..bps].iter().rev());
+                }
+            }
+        }
+        planes
+    });
+    let mut planes: Vec<Vec<u8>> = (0..ch).map(|_| Vec::with_capacity(n * bps)).collect();
+    for part in parts {
         for (c, plane) in planes.iter_mut().enumerate() {
-            let src = &bytes[(i * ch + c) * bps..(i * ch + c + 1) * bps];
-            tmp[..bps].copy_from_slice(src);
-            if invert[c] {
-                invert_sample(&mut tmp[..bps], s);
-            }
-            if cfg!(target_endian = "big") {
-                plane.extend_from_slice(&tmp[..bps]);
-            } else {
-                plane.extend(tmp[..bps].iter().rev());
-            }
+            plane.extend_from_slice(&part[c]);
         }
     }
     planes
@@ -101,6 +125,27 @@ pub fn max_sample(s: SampleType) -> Vec<u8> {
         SampleType::U8 => vec![255],
         SampleType::U16 => 65535u16.to_ne_bytes().to_vec(),
         SampleType::F32 => 1.0f32.to_ne_bytes().to_vec(),
+    }
+}
+
+/// Top of Photoshop's 16-bit Lab a*/b* scale: it stores `32768 + 256·a` (0..65280 spans −128..127,
+/// fitted on psd-tools `4x4_16bit_lab`: the merged image holds a stop's `LbCl` a* = 52.29 as 46154),
+/// while documents keep a*/b* on the 8-bit scale `(a + 128) / 255` at every depth.
+pub const LAB16_CHROMA_MAX: f32 = 65280.0;
+
+/// Rescales the a*/b* channels (1 and 2) of interleaved native-endian 16-bit Lab pixels with
+/// `ch` channels: PSD → document when `to_doc`, else document → PSD. Round-trips exactly.
+pub fn lab16_chroma(bytes: &mut [u8], ch: usize, to_doc: bool) {
+    if ch < 3 {
+        return;
+    }
+    let k = if to_doc { 65535.0 / f64::from(LAB16_CHROMA_MAX) } else { f64::from(LAB16_CHROMA_MAX) / 65535.0 };
+    for px in bytes.chunks_exact_mut(ch * 2) {
+        for c in 1..3 {
+            let v = u16::from_ne_bytes([px[2 * c], px[2 * c + 1]]);
+            let w = (f64::from(v) * k).round().min(65535.0) as u16;
+            px[2 * c..2 * c + 2].copy_from_slice(&w.to_ne_bytes());
+        }
     }
 }
 
@@ -139,8 +184,9 @@ pub fn matte(c: f32, a: f32, white: f32) -> f32 {
 }
 
 /// Inverse of [`matte`] (returns `white` where alpha is 0).
+/// Keep HDR and negative samples; integer encoders own normalized-range clipping.
 pub fn unmatte(m: f32, a: f32, white: f32) -> f32 {
-    if a <= 0.0 { white } else { ((m - white * (1.0 - a)) / a).clamp(0.0, 1.0) }
+    if a <= 0.0 { white } else { (m - white * (1.0 - a)) / a }
 }
 
 /// `items.map(f)` on scoped threads (one per item; callers pass a handful of channels or
@@ -172,6 +218,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn banded_shuffles_match_a_sequential_reference() {
+        fn seq_interleave(planes: &[Option<&[u8]>], fill: &[Vec<u8>], n: usize, s: SampleType, invert: &[bool]) -> Vec<u8> {
+            let bps = s.bytes();
+            let ch = planes.len();
+            let mut out = vec![0u8; n * ch * bps];
+            for (c, plane) in planes.iter().enumerate() {
+                for i in 0..n {
+                    let dst = &mut out[(i * ch + c) * bps..(i * ch + c + 1) * bps];
+                    match plane {
+                        Some(p) if p.len() >= (i + 1) * bps => {
+                            let src = &p[i * bps..(i + 1) * bps];
+                            for k in 0..bps {
+                                dst[k] = src[bps - 1 - k];
+                            }
+                            if invert[c] {
+                                invert_sample(dst, s);
+                            }
+                        }
+                        _ => dst.copy_from_slice(&fill[c]),
+                    }
+                }
+            }
+            out
+        }
+        fn seq_deinterleave(bytes: &[u8], ch: usize, s: SampleType, invert: &[bool]) -> Vec<Vec<u8>> {
+            let bps = s.bytes();
+            let n = bytes.len() / (ch * bps).max(1);
+            let mut planes = vec![Vec::with_capacity(n * bps); ch];
+            let mut tmp = [0u8; 4];
+            for i in 0..n {
+                for (c, plane) in planes.iter_mut().enumerate() {
+                    let src = &bytes[(i * ch + c) * bps..(i * ch + c + 1) * bps];
+                    tmp[..bps].copy_from_slice(src);
+                    if invert[c] {
+                        invert_sample(&mut tmp[..bps], s);
+                    }
+                    plane.extend(tmp[..bps].iter().rev());
+                }
+            }
+            planes
+        }
+        // Odd pixel counts cross band boundaries; a missing plane exercises the fill path.
+        for n in [1usize, 7, 64, 1000] {
+            for s in [SampleType::U8, SampleType::U16, SampleType::F32] {
+                let bps = s.bytes();
+                let planes: Vec<Vec<u8>> = (0..4).map(|c| (0..n * bps).map(|i| (i * 13 + c * 5) as u8).collect()).collect();
+                let mut refs: Vec<Option<&[u8]>> = planes.iter().map(|p| Some(&p[..])).collect();
+                refs[2] = None;
+                let fill: Vec<Vec<u8>> = (0..4).map(|c| vec![c as u8 * 40; bps]).collect();
+                let invert = [false, true, false, true];
+                let got = interleave(&refs, &fill, n, s, &invert);
+                let want = seq_interleave(&refs, &fill, n, s, &invert);
+                assert_eq!(got, want, "interleave n={n}");
+                let planes_back = deinterleave(&got, 4, s, &invert);
+                let want_back = seq_deinterleave(&got, 4, s, &invert);
+                assert_eq!(planes_back, want_back, "deinterleave n={n}");
+            }
+        }
+    }
+
+    #[test]
     fn interleave_roundtrip_all_depths() {
         for s in [SampleType::U8, SampleType::U16, SampleType::F32] {
             let bps = s.bytes();
@@ -195,6 +302,34 @@ mod tests {
     fn missing_planes_use_fill() {
         let il = interleave(&[None, Some(&[5, 6])], &[vec![9], vec![0]], 2, SampleType::U8, &[false, false]);
         assert_eq!(il, vec![9, 5, 9, 6]);
+    }
+
+    #[test]
+    fn lab16_chroma_scale_round_trips() {
+        // Two pixels of three channels: L is untouched, a*/b* rescale, and every PSD value
+        // comes back exactly.
+        let mut all = Vec::new();
+        for v in 0..=u16::MAX {
+            all.extend_from_slice(&v.to_ne_bytes());
+            all.extend_from_slice(&v.to_ne_bytes());
+            all.extend_from_slice(&v.to_ne_bytes());
+        }
+        let orig = all.clone();
+        lab16_chroma(&mut all, 3, true);
+        let px = |b: &[u8], i: usize, c: usize| u16::from_ne_bytes([b[(i * 3 + c) * 2], b[(i * 3 + c) * 2 + 1]]);
+        // Neutral (32768 in PSD) is 128 / 255 of the document scale; 65280 (a* = 127) is the top.
+        assert_eq!(px(&all, 32768, 0), 32768);
+        assert_eq!(px(&all, 32768, 1), (32768.0f64 * 65535.0 / 65280.0).round() as u16);
+        assert_eq!(px(&all, 65280, 2), 65535);
+        lab16_chroma(&mut all, 3, false);
+        for i in 0..=65280usize {
+            assert_eq!(px(&all, i, 1), px(&orig, i, 1), "{i}");
+        }
+        // Short or odd buffers are left alone.
+        let mut short = vec![1u8, 2, 3];
+        lab16_chroma(&mut short, 3, true);
+        lab16_chroma(&mut short, 1, true);
+        assert_eq!(short, [1, 2, 3]);
     }
 
     #[test]

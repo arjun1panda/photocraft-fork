@@ -3,8 +3,15 @@
 //! Pure Rust (std + serde_json). External tools (`cargo`, `curl`, `tar`) are
 //! invoked through `std::process::Command`.
 
+mod corpus;
+mod corpus_pins;
+mod i18n_coverage;
 mod ico;
 mod layers;
+mod perf;
+mod pinned;
+mod scorecard;
+mod sha256;
 mod stats;
 mod version;
 
@@ -18,10 +25,22 @@ commands:
   layers          enforce the crate dependency layering (plan/architecture.md §3)
   wasm            cargo check --target wasm32-unknown-unknown for the wasm-safe crates
   ci              fmt --check, clippy -D warnings, test, layers, wasm (stops at first failure)
-  corpus [--download]
-                  show where test corpora live; --download fetches PngSuite into corpus/pngsuite
+  corpus [--all | --pngsuite | --psd | --psd-tools | --photoshop] [--local] [--update-manifest]
+                  show where test corpora live and their pins (xtask/src/corpus_pins.rs), or fetch
+                  them into corpus/ (pinned commits, sha256-verified; --all = every corpus;
+                  --photoshop --local copies from ../photocraft-corpus or $PHOTOCRAFT_CORPUS_REPO)
+  test-corpus [-p <crate>]... [--changed] [--local] [-- <test args>]
+                  fetch every corpus, then cargo test --release --features corpus on the corpus
+                  crates; --changed runs only if psd/io/codecs/compose/gpu/text/format changed;
+                  --local takes corpus/photoshop from the photocraft-corpus authoring clone
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
   parity          Photoshop menu parity; rewrites docs/parity.md
+  i18n-coverage   report stable UI translation coverage for registered languages
+  perf [--quick] [--update-baseline] [--threshold PCT] [--bench NAME]... [--skip-build] [--reuse]
+                  run the release benches, merge them by scenario id into target/perf/results.json,
+                  check perf/budgets.toml and perf/baseline.json (non-zero on a broken budget or regression)
+  scorecard [--check]
+                  regenerate docs/scorecard.md (--check: fail if it is stale)
   version [set X.Y.Z[-pre]]
                   print the workspace version, or set it (Cargo.toml + Cargo.lock)
   ico <out.ico> <in.png>...
@@ -35,9 +54,13 @@ fn main() -> ExitCode {
         Some("layers") => cmd_layers(),
         Some("wasm") => cmd_wasm(),
         Some("ci") => cmd_ci(),
-        Some("corpus") => cmd_corpus(rest.contains(&"--download")),
+        Some("corpus") => corpus::cmd(&rest),
+        Some("test-corpus") => corpus::test_cmd(&rest),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("parity") => cmd_parity(),
+        Some("i18n-coverage") => i18n_coverage::run(&root()),
+        Some("perf") => perf::run(&root(), &rest),
+        Some("scorecard") => scorecard::run(&root(), &rest),
         Some("version") => version::run(&root(), &rest),
         Some("ico") => ico::run(&rest),
         Some("-h" | "--help" | "help") | None => {
@@ -129,6 +152,10 @@ fn wasm_set() -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Optional features that official builds enable and the web app ships, also checked for wasm32:
+/// (package, feature).
+const WASM_FEATURES: &[(&str, &str)] = &[("photocraft-codecs", "heif")];
+
 fn cmd_wasm() -> Result<(), String> {
     let set = wasm_set()?;
     let mut results = Vec::new();
@@ -137,6 +164,12 @@ fn cmd_wasm() -> Result<(), String> {
         c.args(["check", "--target", "wasm32-unknown-unknown", "-p", pkg]);
         let ok = run(c, &format!("cargo check --target wasm32-unknown-unknown -p {pkg}")).is_ok();
         results.push((pkg.clone(), ok));
+    }
+    for (pkg, feature) in WASM_FEATURES {
+        let mut c = cargo();
+        c.args(["check", "--target", "wasm32-unknown-unknown", "-p", pkg, "--features", feature]);
+        let ok = run(c, &format!("cargo check --target wasm32-unknown-unknown -p {pkg} --features {feature}")).is_ok();
+        results.push((format!("{pkg} --features {feature}"), ok));
     }
     println!("\nwasm32-unknown-unknown check:");
     for (p, ok) in &results {
@@ -200,40 +233,4 @@ fn cmd_ci() -> Result<(), String> {
     }
     println!("\nCI summary: all {} steps passed ({})", done.len(), done.join(", "));
     Ok(())
-}
-
-const PNGSUITE_URL: &str = "http://www.schaik.com/pngsuite/PngSuite-2017jul19.tgz";
-
-fn cmd_corpus(download: bool) -> Result<(), String> {
-    let corpus = root().join("corpus");
-    println!(
-        "Test corpora live under {} (git-ignored, never committed).
-Tests that use a corpus skip cleanly when it is absent.
-
-  corpus/pngsuite/   PngSuite (public domain) — photocraft-codecs compares every file
-                     against the `image` crate. Fetch: cargo xtask corpus --download
-  corpus/psd/        PSD samples from MIT/BSD projects (ag-psd, psd-tools test data).
-                     Copy files in manually; licences must be MIT/BSD/CC0.
-  corpus/tiff/       libtiff pics (optional)
-  corpus/exr/        OpenEXR sample images (optional)
-  corpus/raw/        raw.pixls.us samples, CC0 (optional)
-",
-        corpus.display()
-    );
-    if !download {
-        return Ok(());
-    }
-    let dest = corpus.join("pngsuite");
-    std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    let tgz = corpus.join("PngSuite-2017jul19.tgz");
-    let mut curl = Command::new("curl");
-    curl.args(["-fsSL", "-o"]).arg(&tgz).arg(PNGSUITE_URL);
-    run(curl, &format!("curl {PNGSUITE_URL}"))?;
-    let mut tar = Command::new("tar");
-    tar.arg("-xzf").arg(&tgz).arg("-C").arg(&dest);
-    run(tar, "tar -xzf PngSuite-2017jul19.tgz")?;
-    let _ = std::fs::remove_file(&tgz);
-    let n = std::fs::read_dir(&dest).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "png")).count()).unwrap_or(0);
-    println!("PngSuite: {n} PNG files in {}", dest.display());
-    if n == 0 { Err("no PNG files extracted".into()) } else { Ok(()) }
 }

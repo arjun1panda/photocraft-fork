@@ -1,6 +1,6 @@
 use photocraft_color::{Color, PixelFormat, SampleType};
 use photocraft_doc::TextLayer;
-use photocraft_doc::text::{CharStyle, FontFeature, ParagraphRun, ParagraphStyle, TextAlign, TextDirection, TextRun, TextShape};
+use photocraft_doc::text::{CharStyle, FontFeature, Orientation, ParagraphRun, ParagraphStyle, TextAlign, TextDirection, TextRun, TextShape};
 use photocraft_geom::Affine;
 
 use crate::{TextEngine, fonts};
@@ -307,6 +307,43 @@ fn empty_text_and_empty_lines() {
     assert_eq!(r.rect.width(), 0);
 }
 
+/// U+0003 is a forced line break inside a paragraph (as PSD type stores Shift+Return): a new
+/// line with the paragraph's leading and no paragraph spacing, never a missing-glyph box.
+#[test]
+fn forced_line_break_starts_a_line_in_the_same_paragraph() {
+    let mut e = TextEngine::new();
+    let text = "one\u{3}two";
+    let spaced = ParagraphStyle { space_before_pt: 5.0, space_after_pt: 5.0, ..Default::default() };
+    let l = e.layout(&with_para(point(text, 10.0), spaced.clone()), 72.0);
+    assert_eq!(l.lines.len(), 2, "{:?}", l.lines);
+    assert_eq!(text[l.lines[0].range.clone()].trim_end_matches('\u{3}'), "one");
+    assert_eq!(&text[l.lines[1].range.clone()], "two");
+    assert_eq!((l.lines[0].paragraph, l.lines[1].paragraph), (0, 0));
+    assert!((l.lines[1].baseline - 12.0).abs() < 1e-3, "auto leading, no paragraph spacing: {}", l.lines[1].baseline);
+    assert!(l.glyphs.iter().all(|g| g.id != 0), "no .notdef for the break");
+    // A paragraph break in the same place adds the spacing.
+    let p = e.layout(&with_para(point("one\ntwo", 10.0), spaced), 72.0);
+    assert!((p.lines[1].baseline - 22.0).abs() < 1e-3, "{}", p.lines[1].baseline);
+    // Centred lines are centred on their own, and box text breaks there too.
+    let c = e.layout(&with_para(point("a\u{3}wide line", 20.0), ParagraphStyle { align: TextAlign::Center, ..Default::default() }), 72.0);
+    assert_eq!(c.lines.len(), 2);
+    assert!((c.lines[0].x0 + c.lines[0].x1).abs() < 0.01 && (c.lines[1].x0 + c.lines[1].x1).abs() < 0.01, "{:?}", c.lines);
+    let mut b = point("short\u{3}next", 12.0);
+    b.shape = TextShape::Box { x: 0.0, y: 0.0, width: 500.0, height: 500.0 };
+    assert_eq!(e.layout(&b, 72.0).lines.len(), 2);
+    // Rendered at every depth: two rows of ink, and nothing after the first line's text.
+    for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+        let (l, r) = e.render(&TextLayer { transform: Affine::translate(0.0, 40.0), ..point(text, 20.0) }, 72.0, fmt);
+        let row = |i: usize| {
+            let ln = &l.lines[i];
+            photocraft_geom::Rect::new(-2, (ln.baseline - ln.ascent + 40.0) as i32, 200, (ln.baseline + 40.0) as i32)
+        };
+        assert!(alpha_sum(&r.surface, row(0)) > 1.0 && alpha_sum(&r.surface, row(1)) > 1.0, "{fmt:?}");
+        let one_end = l.lines[0].x1.ceil() as i32 + 2;
+        assert!(alpha_sum(&r.surface, photocraft_geom::Rect::new(one_end, row(0).y0, 200, row(0).y1)) < 1e-3, "{fmt:?}: ink after the first line's text");
+    }
+}
+
 #[test]
 fn postscript_names() {
     let g = fonts::guess_from_postscript("MyriadPro-BoldIt");
@@ -446,6 +483,166 @@ fn warp_bends_rendered_text_and_outlines() {
     }
 }
 
+/// `Txt2` as Photoshop writes it (a bare `/key value` sequence; text objects at `/1 /1`, style
+/// runs at `/0 /6 /0`, auto-kern mode at `/11`), for the layer text `text`.
+fn txt2_with_modes(text: &str, modes: &[(usize, i64)]) -> Vec<u8> {
+    let mut v = b"\n\n/98 << /0 14 >> /0 << >> /1 << /1 [ << /0 << /0 (\xfe\xff".to_vec();
+    for u in format!("{text}\r").encode_utf16() {
+        let b = u.to_be_bytes();
+        for x in b {
+            if matches!(x, b'(' | b')' | b'\\') {
+                v.push(b'\\');
+            }
+            v.push(x);
+        }
+    }
+    v.extend_from_slice(b") /6 << /0 [ ");
+    for (len, m) in modes {
+        v.extend_from_slice(format!("<< /0 << /0 << /0 (\u{fe}\u{ff}) /6 << /0 0 /11 {m} >> >> >> /1 {len} >> ").as_bytes());
+    }
+    v.extend_from_slice(b"] >> >> >> ] >>");
+    v
+}
+
+fn with_text_index(tysh: &[u8], index: i32) -> Vec<u8> {
+    let mut t = crate::psd::parse_tysh(tysh).unwrap();
+    t.text.items.retain(|(k, _)| !k.is("TextIndex"));
+    t.text.items.push((photocraft_psd::descriptor::Id::new("TextIndex"), photocraft_psd::descriptor::Value::Integer(index)));
+    crate::psd::write_tysh(&t)
+}
+
+/// Optical (and "0") kerning only lives in `Txt2`: import applies it when the layer's
+/// `TextIndex` object still holds the same text.
+#[test]
+fn txt2_carries_optical_kerning() {
+    use photocraft_doc::text::Kerning;
+    let t = styled("AVA", CharStyle::default());
+    let tysh = with_text_index(&crate::psd::build_tysh(&t, 72.0, None), 0);
+    let mut back = crate::psd::text_layer_from_tysh(&tysh, 72.0).unwrap();
+    assert!(back.char_runs().iter().all(|r| r.style.kerning == Kerning::Metrics));
+    // "AVA\r": two optical characters, then manual ("0") for the last and the break.
+    let txt2 = crate::psd::parse_txt2(&txt2_with_modes("AVA", &[(2, 2), (2, 0)])).unwrap();
+    crate::psd::apply_txt2(&mut back, &tysh, &txt2);
+    let modes: Vec<(usize, Kerning)> = back.char_runs().iter().map(|r| (r.len, r.style.kerning)).collect();
+    assert_eq!(modes, vec![(2, Kerning::Optical), (1, Kerning::Off)]);
+    // Stale Txt2 (other text), another index or garbage: nothing changes, nothing panics.
+    for (data, index) in [(txt2_with_modes("AVX", &[(4, 2)]), 0), (txt2_with_modes("AVA", &[(4, 2)]), 3), (b"<< /1 [ (x".to_vec(), 0), (Vec::new(), 0)] {
+        let tysh = with_text_index(&crate::psd::build_tysh(&t, 72.0, None), index);
+        let mut l = crate::psd::text_layer_from_tysh(&tysh, 72.0).unwrap();
+        if let Some(txt2) = crate::psd::parse_txt2(&data) {
+            crate::psd::apply_txt2(&mut l, &tysh, &txt2);
+        }
+        assert!(
+            l.char_runs().iter().all(|r| r.style.kerning == Kerning::Metrics),
+            "case {index}: {:?}",
+            l.char_runs().iter().map(|r| r.style.kerning).collect::<Vec<_>>()
+        );
+    }
+    // Run lengths longer than the text, zero lengths and odd modes are tolerated.
+    let txt2 = crate::psd::parse_txt2(&txt2_with_modes("AVA", &[(0, 2), (100, 2), (5, 9)])).unwrap();
+    let mut l = crate::psd::text_layer_from_tysh(&tysh, 72.0).unwrap();
+    crate::psd::apply_txt2(&mut l, &tysh, &txt2);
+    assert!(l.char_runs().iter().all(|r| r.style.kerning == Kerning::Optical));
+}
+
+/// Photopea needs an enabled fill, not just FillColor, to paint text after an edit. Inspect the
+/// serialized TySh rather than our renderer, which does not consume the PSD fill flag.
+#[test]
+fn psd_text_fill_is_enabled_in_runs_and_new_default_styles() {
+    let mut t = point("AB", 100.0);
+    t.runs = vec![
+        TextRun { len: 1, style: CharStyle { color: Color::rgb(0.2, 0.4, 0.6), ..Default::default() } },
+        TextRun { len: 1, style: CharStyle { faux_bold: true, size_pt: 100.0, ..Default::default() } },
+    ];
+    for shape in [TextShape::Point, TextShape::Box { x: 0.0, y: 0.0, width: 300.0, height: 200.0 }] {
+        t.shape = shape;
+        let tysh = crate::psd::parse_tysh(&crate::psd::build_tysh(&t, 72.0, None)).unwrap();
+        let data = crate::psd::engine_data(&tysh.text).unwrap();
+        let runs = data.path(&["EngineDict", "StyleRun", "RunArray"]).unwrap().as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        for run in runs {
+            assert_eq!(run.path(&["StyleSheet", "StyleSheetData", "FillFlag"]).and_then(crate::engine_data::Value::as_bool), Some(true));
+        }
+        for key in ["ResourceDict", "DocumentResources"] {
+            let sheets = data.path(&[key, "StyleSheetSet"]).unwrap().as_array().unwrap();
+            assert_eq!(sheets[0].path(&["StyleSheetData", "FillFlag"]).and_then(crate::engine_data::Value::as_bool), Some(true));
+        }
+        let back = crate::psd::text_layer_from_tysh(&crate::psd::write_tysh(&tysh), 72.0).unwrap();
+        assert_eq!(back.text, t.text);
+        assert_eq!(back.runs.len(), t.runs.len());
+        for (actual, expected) in back.runs.iter().zip(&t.runs) {
+            assert_eq!(actual.style.color, expected.style.color);
+            assert_eq!(actual.style.size_pt, expected.style.size_pt);
+            assert_eq!(actual.style.faux_bold, expected.style.faux_bold);
+        }
+    }
+}
+
+#[test]
+fn psd_text_fill_is_enabled_after_editing_a_legacy_export() {
+    use crate::engine_data::Value as E;
+    // A legacy PhotoCraft export has a normal style and character runs without FillFlag.
+    let mut t = point("Before", 40.0);
+    let mut legacy = crate::psd::parse_tysh(&crate::psd::build_tysh(&t, 72.0, None)).unwrap();
+    fn remove_fill_flags(value: &mut E) {
+        match value {
+            E::Dict(items) => {
+                items.retain(|(key, _)| key != "FillFlag");
+                for (_, value) in items {
+                    remove_fill_flags(value);
+                }
+            }
+            E::Array(items) => items.iter_mut().for_each(remove_fill_flags),
+            _ => {}
+        }
+    }
+    let mut data = crate::psd::engine_data(&legacy.text).unwrap();
+    remove_fill_flags(&mut data);
+    for (key, value) in &mut legacy.text.items {
+        if key.as_bytes() == b"EngineData" {
+            *value = photocraft_psd::descriptor::Value::RawData(crate::engine_data::write(&data));
+        }
+    }
+    t.psd_raw = Some(crate::psd::write_tysh(&legacy).into());
+    t.text = "After".into();
+    let tysh = crate::psd::parse_tysh(&crate::psd::build_tysh(&t, 72.0, None)).unwrap();
+    let data = crate::psd::engine_data(&tysh.text).unwrap();
+    let runs = data.path(&["EngineDict", "StyleRun", "RunArray"]).unwrap().as_array().unwrap();
+    assert!(!runs.is_empty());
+    for run in runs {
+        assert_eq!(run.path(&["StyleSheet", "StyleSheetData", "FillFlag"]).and_then(E::as_bool), Some(true));
+    }
+}
+
+/// EngineData pair fields: manual kerning and "no automatic kerning" round-trip exactly, in
+/// Photoshop's form (see `psd::pair_runs`).
+#[test]
+fn psd_round_trips_manual_kerning() {
+    use photocraft_doc::text::Kerning::{Metrics as M, Off as O};
+    let s = CharStyle::default();
+    let cases: Vec<Vec<(usize, photocraft_doc::text::Kerning, f32)>> = vec![
+        vec![(1, O, 100.0), (1, O, -50.0), (2, M, 0.0)],
+        vec![(1, M, 0.0), (1, O, 0.0), (2, M, 0.0)],
+        vec![(4, O, 0.0)],
+        vec![(2, M, 0.0), (1, O, 25.0), (1, M, 0.0)],
+        vec![(3, M, 0.0), (1, O, 300.0)],
+    ];
+    for runs in cases {
+        let t = runs_of("AVAT", &runs.iter().map(|&(len, kerning, kern)| (len, CharStyle { kerning, kern, ..s.clone() })).collect::<Vec<_>>());
+        let back = crate::psd::text_layer_from_tysh(&crate::psd::build_tysh(&t, 72.0, None), 72.0).unwrap();
+        let per = |t: &TextLayer| t.char_runs().iter().flat_map(|r| std::iter::repeat_n((r.style.kerning, r.style.kern), r.len)).collect::<Vec<_>>();
+        let mut want = per(&t);
+        // The last character's mode has no EngineData slot (it reads back as Metrics unless
+        // it has a manual kern).
+        if let Some(last) = want.last_mut()
+            && last.1 == 0.0
+        {
+            last.0 = M;
+        }
+        assert_eq!(per(&back), want, "{runs:?}");
+    }
+}
+
 #[test]
 fn psd_round_trips_antialias_opentype_and_warp() {
     use photocraft_doc::text::{AntiAlias, TextWarp};
@@ -484,4 +681,295 @@ fn engine_data_template_without_engine_dict() {
         let text = e.path(&["EngineDict", "Editor", "Text"]);
         assert!(matches!(text, Some(E::String(s)) if s == "Hi\r"), "{text:?}");
     }
+}
+
+/// #123: the caret geometry (clusters, lines) sits on the rendered glyphs, so a click on a glyph
+/// lands next to it: its left part before it, its right part after it. Plain text, tracking,
+/// horizontal scale, mixed sizes, and centred, wrapped paragraph text.
+#[test]
+fn clusters_sit_on_rendered_glyphs() {
+    let mut e = TextEngine::new();
+    let big = CharStyle { size_pt: 40.0, ..Default::default() };
+    let small = CharStyle { size_pt: 18.0, ..Default::default() };
+    let mixed =
+        TextLayer { text: "HOHOHO".into(), runs: vec![TextRun { len: 3, style: big.clone() }, TextRun { len: 3, style: small.clone() }], ..Default::default() };
+    let boxed = with_para(
+        TextLayer { shape: TextShape::Box { x: 0.0, y: 0.0, width: 150.0, height: 200.0 }, ..styled("HOH HOH HOH HOH", small.clone()) },
+        ParagraphStyle { align: TextAlign::Center, ..Default::default() },
+    );
+    let cases = [
+        ("plain", styled("HOHOH", big.clone())),
+        ("tracking", styled("HOHOH", CharStyle { tracking: 300.0, ..big.clone() })),
+        ("hscale", styled("HOHOH", CharStyle { horizontal_scale: 1.6, ..big.clone() })),
+        ("kerned", styled("HOHOH", CharStyle { kern: 250.0, kerning: photocraft_doc::text::Kerning::Optical, ..big.clone() })),
+        ("mixed", mixed),
+        ("box", boxed),
+    ];
+    for (name, t) in cases {
+        let t = TextLayer { transform: Affine::translate(7.0, 60.0), ..t };
+        let (l, r) = e.render(&t, 72.0, PixelFormat::RGBA8);
+        assert!(l.lines.len() >= if name == "box" { 2 } else { 1 }, "{name}");
+        for c in l.clusters.iter().filter(|c| !t.text[c.range.clone()].trim().is_empty()) {
+            let ln = &l.lines[c.line];
+            // Ink under the cluster's middle, between the line's ascent and descent.
+            let col = photocraft_geom::Rect::new(
+                (c.x + c.advance * 0.3 + 7.0).floor() as i32,
+                (ln.baseline - ln.ascent + 60.0).floor() as i32,
+                (c.x + c.advance * 0.55 + 7.0).ceil() as i32,
+                (ln.baseline + ln.descent + 60.0).ceil() as i32,
+            );
+            assert!(alpha_sum(&r.surface, col) > 1.0, "{name}: no ink under cluster {:?} ({col:?})", c.range);
+            let y = ln.baseline - ln.ascent * 0.4;
+            assert_eq!(l.hit_test(c.x + c.advance * 0.2, y), c.range.start, "{name}: left part of {:?}", c.range);
+            assert_eq!(l.hit_test(c.x + c.advance * 0.8, y), c.range.end, "{name}: right part of {:?}", c.range);
+            let (cx, top, bottom) = l.caret(c.range.start);
+            assert!((cx - c.x).abs() < 1e-3 && top < y && bottom > y, "{name}: caret at {:?}", c.range);
+        }
+    }
+}
+
+fn runs_of(text: &str, styles: &[(usize, CharStyle)]) -> TextLayer {
+    TextLayer { text: text.into(), runs: styles.iter().map(|(len, style)| TextRun { len: *len, style: style.clone() }).collect(), ..Default::default() }
+}
+
+/// Manual kerning (1/1000 em) after a character moves everything after it by kern × size.
+#[test]
+fn manual_kerning_moves_the_next_glyph() {
+    use photocraft_doc::text::Kerning;
+    let mut e = TextEngine::new();
+    let s = CharStyle { size_pt: 100.0, ..Default::default() };
+    let plain = e.layout(&styled("HOH", s.clone()), 72.0);
+    let kerned = e.layout(&runs_of("HOH", &[(1, CharStyle { kern: 100.0, ..s.clone() }), (2, s.clone())]), 72.0);
+    let x = |l: &crate::TextLayout, i: usize| l.glyphs[i].x;
+    assert_eq!(x(&kerned, 0), x(&plain, 0));
+    // 100/1000 em at 100 px = 10 px, for the next glyph and everything after it.
+    assert!((x(&kerned, 1) - x(&plain, 1) - 10.0).abs() < 1e-3, "{} vs {}", x(&kerned, 1), x(&plain, 1));
+    assert!((x(&kerned, 2) - x(&plain, 2) - 10.0).abs() < 1e-3);
+    assert!((width(&kerned) - width(&plain) - 10.0).abs() < 1e-3);
+    // Carets follow: the cluster after the kerned pair starts 10 px later.
+    assert!((kerned.caret(1).0 - plain.caret(1).0 - 10.0).abs() < 1e-3);
+    // Negative kerning tightens; kerning on the last character doesn't move anything.
+    let tight = e.layout(&runs_of("HOH", &[(1, CharStyle { kern: -50.0, ..s.clone() }), (2, s.clone())]), 72.0);
+    assert!((x(&tight, 1) - x(&plain, 1) + 5.0).abs() < 1e-3);
+    let last = e.layout(&runs_of("HOH", &[(2, s.clone()), (1, CharStyle { kern: 500.0, ..s.clone() })]), 72.0);
+    assert!((width(&last) - width(&plain)).abs() < 1e-3);
+    // Off replaces the font's pair kerning: "AV" with Off is wider than with Metrics.
+    let mut av = |st: CharStyle| e.layout(&styled("AV", st), 72.0).glyphs[1].x;
+    let metric = av(s.clone());
+    let off = av(CharStyle { kerning: Kerning::Off, ..s.clone() });
+    assert!(off > metric + 1.0, "Inter kerns AV: {off} vs {metric}");
+    // Centred point text stays centred around the anchor with kerning.
+    let centred = with_para(
+        runs_of("HOH", &[(1, CharStyle { kern: 300.0, ..s.clone() }), (2, s.clone())]),
+        ParagraphStyle { align: TextAlign::Center, ..Default::default() },
+    );
+    let l = e.layout(&centred, 72.0);
+    assert!((l.lines[0].x0 + l.lines[0].x1).abs() < 0.5, "{:?}", l.lines[0]);
+}
+
+/// Optical kerning computes pair spacing from the outlines: tighter for open pairs ("AV", "To")
+/// than the unkerned advance, about neutral for straight stems, and never absurd.
+#[test]
+fn optical_kerning_tightens_open_pairs() {
+    use photocraft_doc::text::Kerning;
+    let mut e = TextEngine::new();
+    let s = CharStyle { size_pt: 100.0, ..Default::default() };
+    let gap = |e: &mut TextEngine, text: &str, k: Kerning| {
+        let l = e.layout(&styled(text, CharStyle { kerning: k, ..s.clone() }), 72.0);
+        l.glyphs[1].x - l.glyphs[0].x
+    };
+    for pair in ["AV", "To", "LT", "Ty"] {
+        let off = gap(&mut e, pair, Kerning::Off);
+        let optical = gap(&mut e, pair, Kerning::Optical);
+        assert!(optical < off - 3.0, "{pair}: optical {optical} vs unkerned {off}");
+    }
+    for pair in ["HH", "nn", "oo", "HO"] {
+        let off = gap(&mut e, pair, Kerning::Off);
+        let optical = gap(&mut e, pair, Kerning::Optical);
+        assert!((optical - off).abs() < 6.0, "{pair}: optical {optical} vs unkerned {off}");
+    }
+    // A space breaks the pair; a manual kern replaces the automatic one (as in Photoshop).
+    assert_eq!(gap(&mut e, "A V", Kerning::Optical), gap(&mut e, "A V", Kerning::Off));
+    for mode in [Kerning::Optical, Kerning::Metrics] {
+        let l = e.layout(&styled("AV", CharStyle { kerning: mode, kern: 100.0, ..s.clone() }), 72.0);
+        let off = gap(&mut e, "AV", Kerning::Off);
+        assert!((l.glyphs[1].x - l.glyphs[0].x - off - 10.0).abs() < 1e-3, "{mode:?}");
+    }
+}
+
+/// A mode change splits shaping runs: the pairs on both sides of a manually kerned character
+/// lose their automatic kerning (Photoshop renders it the same way).
+#[test]
+fn kerning_modes_split_pairs() {
+    use photocraft_doc::text::Kerning;
+    let mut e = TextEngine::new();
+    let s = CharStyle { size_pt: 100.0, ..Default::default() };
+    let off = CharStyle { kerning: Kerning::Off, ..s.clone() };
+    let xs = |e: &mut TextEngine, t: &TextLayer| e.layout(t, 72.0).glyphs.iter().map(|g| g.x).collect::<Vec<_>>();
+    let metric = xs(&mut e, &styled("AVAV", s.clone()));
+    let plain = xs(&mut e, &styled("AVAV", off.clone()));
+    let mixed = xs(&mut e, &runs_of("AVAV", &[(2, s.clone()), (1, off.clone()), (1, s.clone())]));
+    let adv = |v: &[f32], i: usize| v[i + 1] - v[i];
+    assert!((adv(&mixed, 0) - adv(&metric, 0)).abs() < 1e-3, "AV before stays kerned");
+    assert!((adv(&mixed, 1) - adv(&plain, 1)).abs() < 1e-3, "VA into the manual character");
+    assert!((adv(&mixed, 2) - adv(&plain, 2)).abs() < 1e-3, "AV out of it");
+}
+
+#[test]
+fn japanese_dictionary_word_boundaries() {
+    // Use only the existing bundled Latin fonts: segmentation must not require a CJK font.
+    let text = "私は学生です";
+    let mut fonts = fonts::FontDb::new();
+    let mut context = parley::LayoutContext::<[u8; 4]>::new();
+    let mut layout = parley::Layout::new();
+    let mut builder = context.ranged_builder(&mut fonts.fcx, text, 1.0, false);
+    builder.push_default(parley::StyleProperty::FontFamily(parley::FontFamily::named("Inter")));
+    // Suppress CJK line-break opportunities so these flags expose word boundaries alone.
+    builder.push_default(parley::StyleProperty::WordBreak(parley::WordBreak::KeepAll));
+    builder.build_into(&mut layout, text);
+    layout.break_all_lines(None);
+    let mut boundaries = Vec::new();
+    for line in layout.lines() {
+        for run in line.runs() {
+            for cluster in run.clusters() {
+                if cluster.is_word_boundary() {
+                    boundaries.push(cluster.text_range().start);
+                }
+            }
+        }
+    }
+    assert_eq!(boundaries, vec![0, 3, 6, 12]);
+}
+
+#[test]
+fn japanese_box_text_preserves_wrap_boundaries() {
+    let mut engine = TextEngine::new();
+    let mut text = point("日本語の文章を折り返します。", 12.0);
+    text.shape = TextShape::Box { x: 0.0, y: 0.0, width: 40.0, height: 1000.0 };
+    let layout = engine.layout(&text, 72.0);
+    assert!(layout.lines.len() > 1);
+    let mut end = 0;
+    for line in &layout.lines {
+        assert_eq!(line.range.start, end);
+        let content = text.text.get(line.range.clone()).expect("UTF-8 line boundaries");
+        assert!(!content.starts_with('。'), "closing punctuation must stay with its preceding text");
+        end = line.range.end;
+    }
+    assert_eq!(end, text.text.len());
+}
+
+/// Which craft-fonts family drew the glyphs of `l` (matched by the embedded bytes).
+fn craft_family_of(l: &crate::TextLayout) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    for g in &l.glyphs {
+        let Some(face) = l.faces.get(g.face as usize) else { continue };
+        let data: &[u8] = face.font.data.as_ref();
+        if let Some(f) = crate::CRAFT_FONTS.iter().find(|f| std::ptr::eq(f.bytes.as_ptr(), data.as_ptr()) && f.bytes.len() == data.len())
+            && !v.contains(&f.family)
+        {
+            v.push(f.family);
+        }
+    }
+    v
+}
+
+#[test]
+fn craft_fonts_cover_japanese_without_system_fonts() {
+    if !crate::CRAFT_FONTS.iter().any(|f| f.is_japanese()) {
+        eprintln!("skipping: built without craft-fonts (set CRAFT_FONTS_DIR to a craft-fonts checkout)");
+        return;
+    }
+    let mut e = TextEngine::new();
+    let text = "日本語の文字、カタカナ。";
+    let l = e.layout(&point(text, 24.0), 72.0);
+    assert_eq!(l.glyphs.len(), text.chars().count());
+    assert!(l.glyphs.iter().all(|g| g.id != 0), "no .notdef with craft-fonts");
+    // Sans (Inter) runs fall back to the Gothic UI family.
+    assert_eq!(craft_family_of(&l), vec![crate::craft_fonts::UI_JAPANESE_FAMILY]);
+    // Serif runs fall back to a Mincho face when the build has one (not the web build).
+    if crate::CRAFT_FONTS.iter().any(|f| f.is_mincho()) {
+        let mut t = point(text, 24.0);
+        t.font_family = "Times New Roman".into();
+        let l = e.layout(&t, 72.0);
+        assert!(l.glyphs.iter().all(|g| g.id != 0));
+        let fams = craft_family_of(&l);
+        assert!(fams.len() == 1 && fams[0].contains("Mincho"), "{fams:?}");
+    }
+    // Latin keeps Inter.
+    let l = e.layout(&point("Layer 1", 24.0), 72.0);
+    assert!(craft_family_of(&l).is_empty());
+}
+
+#[test]
+fn works_without_craft_fonts() {
+    // Whatever the build: the bundled fonts load, Latin lays out, and Japanese never panics
+    // (without craft-fonts or system fonts it may be .notdef).
+    let mut e = TextEngine::new();
+    assert!(e.fonts.has_family("Inter"));
+    let l = e.layout(&point("日本語 Latin", 12.0), 72.0);
+    assert_eq!(l.glyphs.len(), "日本語 Latin".chars().count());
+    for f in crate::CRAFT_FONTS {
+        assert!(e.fonts.has_family(f.family), "{} registered under its manifest name", f.family);
+    }
+    if crate::CRAFT_FONTS.is_empty() {
+        assert!(crate::craft_fonts::japanese_families().is_empty());
+        let fb = fonts::fallback_candidates(&crate::cjk::script_order(Some("ja")));
+        assert!(!fb.iter().any(|f| f.contains("BIZ UD")));
+    }
+}
+
+#[test]
+fn word_and_line_navigation() {
+    use crate::layout::{byte_index, char_index, hit_char, line_edge, line_index, line_step, word_boundary};
+    assert_eq!(word_boundary("hello big world", 0, true), 5);
+    assert_eq!(word_boundary("hello big world", 7, false), 6);
+    assert_eq!(word_boundary("hello big world", 15, false), 10);
+    assert_eq!(word_boundary("hello", 0, false), 0);
+    assert_eq!(word_boundary("hello", 5, true), 5);
+    assert_eq!(word_boundary("", 4, true), 0);
+    assert_eq!(word_boundary("ab", 100, true), 2);
+    assert_eq!(word_boundary("ab, cd", 0, true), 2);
+    assert_eq!(word_boundary("ab, cd", 2, true), 6);
+    assert_eq!(word_boundary("Größe", 0, true), 5);
+
+    let mut e = TextEngine::new();
+    let text = "AäB\ncd";
+    for vertical in [false, true] {
+        let mut t = point(text, 20.0);
+        if vertical {
+            t.orientation = Orientation::Vertical;
+        }
+        let l = e.layout(&t, 72.0);
+        let n = text.chars().count();
+        for i in 0..=n {
+            let b = byte_index(text, i);
+            let [(x0, y0), (x1, y1)] = l.caret_segment(b);
+            let (idx, line) = hit_char(&l, text, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            assert_eq!(idx, i, "vertical {vertical} index {i}");
+            assert_eq!(line, line_index(&l, b), "vertical {vertical} index {i}");
+        }
+        assert!(l.lines.len() >= 2, "vertical {vertical}");
+        let end0 = char_index(text, l.lines[0].range.end);
+        let start1 = char_index(text, l.lines[1].range.start);
+        assert_eq!(line_edge(&l, text, 1, true), end0, "vertical {vertical}");
+        assert_eq!(line_edge(&l, text, 1, false), 0, "vertical {vertical}");
+        assert_eq!(line_edge(&l, text, start1, false), start1, "vertical {vertical}");
+        assert_eq!(line_edge(&l, text, start1, true), n, "vertical {vertical}");
+        let x = l.caret(byte_index(text, 0)).0;
+        let next = line_step(&l, text, 0, x, 1);
+        assert!((start1..=n).contains(&next), "vertical {vertical} line_step -> {next}");
+        assert_eq!(line_step(&l, text, 0, x, -1), 0, "vertical {vertical}");
+        assert_eq!(line_step(&l, text, n, x, 1), n, "vertical {vertical}");
+    }
+
+    // A remembered column stays on the short line's start; the caret's own x falls off its end.
+    let text = "WWWWWW\nI";
+    let l = e.layout(&point(text, 30.0), 72.0);
+    let end0 = line_edge(&l, text, 0, true);
+    // end0 is the first line's end, which is not the second line. Step from there.
+    let kept = line_step(&l, text, end0, l.caret(0).0, 1);
+    let jumped = line_step(&l, text, end0, l.caret(byte_index(text, end0)).0, 1);
+    assert_eq!(kept, char_index(text, l.lines[1].range.start), "kept column");
+    assert_eq!(jumped, char_index(text, l.lines[1].range.end), "own column");
+    assert!(jumped > kept);
 }

@@ -153,6 +153,10 @@ pub struct Sensor {
     pub baseline_exposure: f64,
     /// DNG OpcodeList2 gain maps (lens shading), applied to the normalized data.
     pub gain_maps: Vec<crate::opcodes::GainMap>,
+    /// The camera profile's default tone curve (like DNG ProfileToneCurve): increasing `[input,
+    /// output]` pairs in linear ProPhoto, applied per channel after the colour conversion and
+    /// exposure. Below the first point the curve is a line through 0; empty: no curve.
+    pub tone_curve: Vec<[f32; 2]>,
     pub warnings: Vec<String>,
 }
 
@@ -165,14 +169,14 @@ pub(crate) struct Plane {
     pub data: Vec<u16>,
 }
 
-struct Segment {
-    x: usize,
-    y: usize,
+pub(crate) struct Segment {
+    pub x: usize,
+    pub y: usize,
     /// Encoded width and height (tile size, or image width × rows per strip).
-    w: usize,
-    h: usize,
-    offset: usize,
-    len: usize,
+    pub w: usize,
+    pub h: usize,
+    pub offset: usize,
+    pub len: usize,
 }
 
 /// How a lossless-JPEG tile's samples map onto the tile.
@@ -259,7 +263,7 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
     Ok(Plane { width, height, samples, bits, data })
 }
 
-fn segments(t: &Tiff, ifd: &Ifd, width: usize, height: usize) -> Result<Vec<Segment>> {
+pub(crate) fn segments(t: &Tiff, ifd: &Ifd, width: usize, height: usize) -> Result<Vec<Segment>> {
     let mut out = Vec::new();
     if let (Some(tw), Some(th)) = (t.tag_uint(ifd, tag::TILE_WIDTH), t.tag_uint(ifd, tag::TILE_LENGTH)) {
         let (tw, th) = (tw as usize, th as usize);

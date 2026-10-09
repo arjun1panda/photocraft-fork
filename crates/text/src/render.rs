@@ -8,7 +8,7 @@ use skrifa::instance::{LocationRef, NormalizedCoord, Size};
 use skrifa::outline::DrawSettings;
 use skrifa::{GlyphId, MetadataProvider};
 
-use crate::layout::TextLayout;
+use crate::layout::{GlyphOrient, PlacedGlyph, TextLayout};
 use crate::raster::{Bounds, Coverage, LineSink, Pen, Xform, rect_to};
 use crate::warp::Warp;
 
@@ -66,12 +66,7 @@ fn draw(layout: &TextLayout, transform: &Xform, sink: &mut impl LineSink, only_c
             continue;
         };
         let coords: Vec<NormalizedCoord> = face.coords.iter().map(|&c| NormalizedCoord::from_bits(c)).collect();
-        let hs = if st.horizontal_scale > 0.0 { st.horizontal_scale } else { 1.0 } as f64;
-        let vs = if st.vertical_scale > 0.0 { st.vertical_scale } else { 1.0 } as f64;
-        let skew_deg = if st.faux_italic { FAUX_ITALIC_DEG } else { 0.0 } + face.skew_deg;
-        let skew = (skew_deg as f64).to_radians().tan() * vs;
-        let shift = (st.baseline_shift_pt * layout.px_per_pt) as f64;
-        let glyph = Xform([hs, 0.0, skew, -vs, g.x as f64, g.y as f64 - shift]);
+        let glyph = glyph_xform(layout, g, face.skew_deg);
         let bold = st.faux_bold || face.embolden;
         let r = (face.size_px * FAUX_BOLD_RADIUS) as f64;
         let offsets: &[(f64, f64)] =
@@ -111,6 +106,25 @@ fn draw(layout: &TextLayout, transform: &Xform, sink: &mut impl LineSink, only_c
     }
 }
 
+/// Font units (scaled to px, y up) → text space for a placed glyph: scales, faux italic,
+/// baseline shift, and the vertical-type orientation.
+fn glyph_xform(layout: &TextLayout, g: &PlacedGlyph, face_skew_deg: f32) -> Xform {
+    let Some(st) = layout.styles.get(g.style as usize) else { return Xform([1.0, 0.0, 0.0, -1.0, g.x as f64, g.y as f64]) };
+    let hs = if st.horizontal_scale > 0.0 { st.horizontal_scale } else { 1.0 } as f64;
+    let vs = if st.vertical_scale > 0.0 { st.vertical_scale } else { 1.0 } as f64;
+    let skew_deg = if st.faux_italic { FAUX_ITALIC_DEG } else { 0.0 } + face_skew_deg;
+    let skew = (skew_deg as f64).to_radians().tan() * vs;
+    let shift = (st.baseline_shift_pt * layout.px_per_pt) as f64;
+    let (x, y) = (g.x as f64, g.y as f64);
+    match g.orient {
+        GlyphOrient::Horizontal => Xform([hs, 0.0, skew, -vs, x, y - shift]),
+        // Baseline shift moves upright glyphs in vertical type to the right.
+        GlyphOrient::Upright => Xform([hs, 0.0, skew, -vs, x + shift, y]),
+        // 90° clockwise: the glyph's up direction (and its baseline shift) points right.
+        GlyphOrient::Rotated => Xform([0.0, 1.0, -1.0, 0.0, x, y]).mul(&Xform([hs, 0.0, skew, -vs, 0.0, -shift])),
+    }
+}
+
 /// The warp to apply to `layout` (None when `warp` is absent, `warpNone` or flat).
 pub fn layout_warp(layout: &TextLayout, warp: Option<&photocraft_doc::text::TextWarp>) -> Option<Warp> {
     Warp::new(warp?, layout.bounds()?)
@@ -134,14 +148,27 @@ pub fn ink_rect(layout: &TextLayout, transform: &Affine) -> Rect {
     ink_rect_warped(layout, transform, None)
 }
 
+fn rect_from_bounds([x0, y0, x1, y1]: [f64; 4]) -> Rect {
+    if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
+        return Rect::EMPTY;
+    }
+
+    let min = f64::from(i32::MIN);
+    let max = f64::from(i32::MAX);
+    let (x0, y0, x1, y1) =
+        ((x0.floor() - 1.0).clamp(min, max), (y0.floor() - 1.0).clamp(min, max), (x1.ceil() + 1.0).clamp(min, max), (y1.ceil() + 1.0).clamp(min, max));
+    if x1 <= x0 || y1 <= y0 || x1 - x0 > MAX_PIXELS as f64 || y1 - y0 > MAX_PIXELS as f64 {
+        return Rect::EMPTY;
+    }
+
+    Rect::new(x0 as i32, y0 as i32, x1 as i32, y1 as i32)
+}
+
 /// [`ink_rect`] of warped text.
 pub fn ink_rect_warped(layout: &TextLayout, transform: &Affine, warp: Option<&Warp>) -> Rect {
     let mut b = Bounds::default();
     draw(layout, &Xform(transform.m), &mut b, None, warp);
-    match b.rect {
-        Some([x0, y0, x1, y1]) => Rect::new(x0.floor() as i32 - 1, y0.floor() as i32 - 1, x1.ceil() as i32 + 1, y1.ceil() as i32 + 1),
-        None => Rect::new(0, 0, 0, 0),
-    }
+    b.rect.map(rect_from_bounds).unwrap_or(Rect::EMPTY)
 }
 
 /// Rasterizes `layout` through `transform` (text space → document pixels). The result always
@@ -264,7 +291,6 @@ impl skrifa::outline::OutlinePen for Recorder<'_> {
 pub fn outlines(layout: &TextLayout, transform: &Affine, warp: Option<&Warp>) -> Vec<Vec<PathEl>> {
     let mut glyphs = Vec::new();
     for g in &layout.glyphs {
-        let st = &layout.styles[g.style as usize];
         let face = &layout.faces[g.face as usize];
         let Ok(font) = skrifa::FontRef::from_index(face.font.data.as_ref(), face.font.index) else {
             continue;
@@ -273,12 +299,7 @@ pub fn outlines(layout: &TextLayout, transform: &Affine, warp: Option<&Warp>) ->
             continue;
         };
         let coords: Vec<NormalizedCoord> = face.coords.iter().map(|&c| NormalizedCoord::from_bits(c)).collect();
-        let hs = if st.horizontal_scale > 0.0 { st.horizontal_scale } else { 1.0 } as f64;
-        let vs = if st.vertical_scale > 0.0 { st.vertical_scale } else { 1.0 } as f64;
-        let skew_deg = if st.faux_italic { FAUX_ITALIC_DEG } else { 0.0 } + face.skew_deg;
-        let skew = (skew_deg as f64).to_radians().tan() * vs;
-        let shift = (st.baseline_shift_pt * layout.px_per_pt) as f64;
-        let glyph = Xform([hs, 0.0, skew, -vs, g.x as f64, g.y as f64 - shift]);
+        let glyph = glyph_xform(layout, g, face.skew_deg);
         let mut rec = Recorder { glyph, post: Xform(transform.m), warp, out: Vec::new() };
         let settings = DrawSettings::unhinted(Size::new(face.size_px), LocationRef::new(&coords));
         if outline.draw(settings, &mut rec).is_ok() && !rec.out.is_empty() {
@@ -286,4 +307,29 @@ pub fn outlines(layout: &TextLayout, transform: &Affine, warp: Option<&Warp>) ->
         }
     }
     glyphs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_PIXELS, rect_from_bounds};
+    use photocraft_geom::Rect;
+
+    #[test]
+    fn bounds_are_clipped_without_overflow_and_oversized_rectangles_rejected() {
+        let min = f64::from(i32::MIN);
+        let max = f64::from(i32::MAX);
+        let cases = [
+            ([min, 0.0, min + 8.0, 8.0], Rect::new(i32::MIN, -1, i32::MIN + 9, 9)),
+            ([max - 8.0, 0.0, max, 8.0], Rect::new(i32::MAX - 9, -1, i32::MAX, 9)),
+            ([-f64::MAX, 0.0, f64::MAX, 8.0], Rect::EMPTY),
+            ([0.0, 0.0, MAX_PIXELS as f64, 8.0], Rect::EMPTY),
+            ([0.25, -3.25, 10.1, 8.8], Rect::new(-1, -5, 12, 10)),
+        ];
+
+        for (bounds, expected) in cases {
+            let first = rect_from_bounds(bounds);
+            assert_eq!(first, expected, "bounds: {bounds:?}");
+            assert_eq!(rect_from_bounds(bounds), first, "bounds: {bounds:?}");
+        }
+    }
 }

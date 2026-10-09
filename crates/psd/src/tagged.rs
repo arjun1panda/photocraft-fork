@@ -11,8 +11,16 @@ use crate::error::{PsdError, Result};
 use crate::header::Version;
 use crate::io::{Reader, WriteExt};
 
-/// Keys whose length field is 8 bytes in PSB files.
-pub const PSB_LONG_KEYS: [&[u8; 4]; 13] = [b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2", b"FEid", b"FXid", b"PxSD"];
+/// Keys whose length field is 8 bytes in PSB files: the thirteen the Adobe
+/// specification lists, plus keys Photoshop also writes with 8-byte lengths
+/// although the specification omits them (observed in real PSB files, e.g.
+/// `lnkE` and `cinf` in the ag-psd test set, and expected by other PSB
+/// readers such as psd-tools). Reading one of these with a 4-byte length
+/// misaligns every block after it (#200).
+pub const PSB_LONG_KEYS: [&[u8; 4]; 21] = [
+    b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2", b"FEid", b"FXid", b"PxSD", // spec
+    b"lnk3", b"lnkE", b"pths", b"extd", b"extn", b"FELS", b"cinf", b"artd", // observed
+];
 
 /// Returns `true` if `key` uses an 8-byte length in `version`.
 pub fn uses_long_length(version: Version, key: &[u8; 4]) -> bool {
@@ -107,8 +115,14 @@ pub enum BlockData<'a> {
     BlendClippedAsGroup(bool),
     /// `infx`
     BlendInteriorElements(bool),
-    /// `knko`
+    /// `knko`: 0 none, 1 shallow, 2 deep.
     Knockout(u8),
+    /// `tsly`: Transparency Shapes Layer.
+    TransparencyShapes(bool),
+    /// `lmgm`: Layer Mask Hides Effects ("layer mask as global mask").
+    LayerMaskHidesEffects(bool),
+    /// `vmgm`: Vector Mask Hides Effects.
+    VectorMaskHidesEffects(bool),
     /// `lspf`: bit 0 transparency, bit 1 composite, bit 2 position locked.
     Protection(u32),
     /// `lclr`: sheet color index (0 none, 1 red, 2 orange, 3 yellow, 4 green,
@@ -124,6 +138,20 @@ impl TaggedBlock {
     /// A new `8BIM` block with default padding.
     pub fn new(key: [u8; 4], data: Vec<u8>) -> Self {
         TaggedBlock { signature: *b"8BIM", key, data, padding: None }
+    }
+
+    /// `true` for `MIB8` / `46B8`: the signatures [`crate::tiff`] gives a block whose data was
+    /// kept verbatim from a little-endian TIFF because its layout is unknown. Such a block is
+    /// written back exactly into a little-endian TIFF, and cannot go into a big-endian file
+    /// (a PSD) without being dropped: see [`Self::is_foreign_order`].
+    pub fn is_foreign_order_signature(b: &[u8]) -> bool {
+        b.starts_with(b"MIB8") || b.starts_with(b"46B8")
+    }
+
+    /// Whether this block's data is in little-endian layout (see
+    /// [`Self::is_foreign_order_signature`]).
+    pub fn is_foreign_order(&self) -> bool {
+        Self::is_foreign_order_signature(&self.signature)
     }
 
     /// Key as a string (lossy).
@@ -148,6 +176,9 @@ impl TaggedBlock {
             b"clbl" => r.u8().map(|v| BlockData::BlendClippedAsGroup(v != 0)),
             b"infx" => r.u8().map(|v| BlockData::BlendInteriorElements(v != 0)),
             b"knko" => r.u8().map(BlockData::Knockout),
+            b"tsly" => r.u8().map(|v| BlockData::TransparencyShapes(v != 0)),
+            b"lmgm" => r.u8().map(|v| BlockData::LayerMaskHidesEffects(v != 0)),
+            b"vmgm" => r.u8().map(|v| BlockData::VectorMaskHidesEffects(v != 0)),
             b"lspf" => r.u32().map(BlockData::Protection),
             b"lclr" => r.u16().map(BlockData::SheetColor),
             b"iOpa" => r.u8().map(BlockData::FillOpacity),
@@ -203,6 +234,18 @@ impl TaggedBlock {
     pub fn knockout(v: u8) -> Self {
         Self::flag(*b"knko", v)
     }
+    /// `tsly` block.
+    pub fn transparency_shapes(v: bool) -> Self {
+        Self::flag(*b"tsly", u8::from(v))
+    }
+    /// `lmgm` block.
+    pub fn layer_mask_hides_effects(v: bool) -> Self {
+        Self::flag(*b"lmgm", u8::from(v))
+    }
+    /// `vmgm` block.
+    pub fn vector_mask_hides_effects(v: bool) -> Self {
+        Self::flag(*b"vmgm", u8::from(v))
+    }
     /// `lspf` block.
     pub fn protection(flags: u32) -> Self {
         Self::new(*b"lspf", flags.to_be_bytes().to_vec())
@@ -216,6 +259,68 @@ impl TaggedBlock {
     /// `iOpa` block.
     pub fn fill_opacity(v: u8) -> Self {
         Self::flag(*b"iOpa", v)
+    }
+
+    /// Strictly re-parses the internal structure of blocks whose data carries
+    /// its own sizes, so a block that a strict reader would reject is caught
+    /// here: `PlLd` (a `plcL` placed layer), `SoLd`/`SoLE` (`soLD` placed
+    /// layer data), `lnk2`/`lnk3`/`lnkD` (length-prefixed linked files) and
+    /// `lfx2` (object effects). Every inner length must stay inside the block
+    /// and the parse must end at the end of the data, apart from up to three
+    /// zero padding bytes. Other keys are not checked and return `Ok`.
+    ///
+    /// Layouts follow the Adobe Photoshop File Format specification
+    /// ("Additional Layer Information": Placed Layer, Placed Layer Data,
+    /// Linked Layer, Object Based Effects Layer Info).
+    pub fn check_structure(&self) -> Result<()> {
+        let d = &self.data[..];
+        let mut r = Reader::new(d);
+        match &self.key {
+            b"PlLd" => {
+                expect_kind(&mut r, b"plcL")?;
+                let _version = r.u32()?;
+                crate::io::read_pascal(&mut r, 1)?;
+                // Page, total pages, anti-alias policy, layer type; transform (8 doubles).
+                r.skip(4 * 4 + 8 * 8)?;
+                let _warp_version = r.u32()?;
+                crate::descriptor::VersionedDescriptor::read(&mut r)?;
+            }
+            b"SoLd" | b"SoLE" => {
+                expect_kind(&mut r, b"soLD")?;
+                let _version = r.u32()?;
+                let d = crate::descriptor::VersionedDescriptor::read(&mut r)?;
+                check_placed_descriptor(&d.descriptor).map_err(|e| PsdError::invalid(format!("{}: {e}", self.key_str())))?;
+            }
+            b"lfx2" => {
+                let _effects_version = r.u32()?;
+                crate::descriptor::VersionedDescriptor::read(&mut r)?;
+            }
+            b"lnk2" | b"lnk3" | b"lnkD" => {
+                while r.remaining() >= 8 {
+                    let len = r.u64()?;
+                    let item = r.bytes_u64(len)?;
+                    if !matches!(item.get(..4), Some(b"liFD" | b"liFE" | b"liFA")) {
+                        return Err(PsdError::invalid(format!("{}: linked item of unknown type", self.key_str())));
+                    }
+                    if item.get(..4) == Some(b"liFD") {
+                        check_embedded_item(item).map_err(|e| PsdError::invalid(format!("{}: embedded file: {e}", self.key_str())))?;
+                    }
+                    // Items are padded to a multiple of 4.
+                    let pad = ((4 - len % 4) % 4).min(r.remaining() as u64);
+                    r.skip(pad as usize)?;
+                }
+            }
+            b"FEid" | b"FXid" => {
+                crate::filter_effects::FilterEffects::parse(d).map_err(|e| PsdError::invalid(format!("{}: {e}", self.key_str())))?;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+        let rest = r.peek_rest();
+        if rest.len() > 3 || rest.iter().any(|&b| b != 0) {
+            return Err(PsdError::invalid(format!("{}: {} unexpected bytes after the block structure", self.key_str(), rest.len())));
+        }
+        Ok(())
     }
 
     pub(crate) fn write(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
@@ -238,6 +343,64 @@ impl TaggedBlock {
     }
 }
 
+/// Strict check of a `soLD` descriptor: the unique id and transform Photoshop needs to place the
+/// layer, and a well-formed smart filter stack (`filterFX`: a `filterFXList` of `filterFX`
+/// objects, each with a name, blend options, an enabled flag and a filter id).
+fn check_placed_descriptor(d: &crate::descriptor::Descriptor) -> Result<()> {
+    use crate::descriptor::Value;
+    if !matches!(d.get("Idnt"), Some(Value::Text(_))) {
+        return Err(PsdError::invalid("no Idnt (unique id)"));
+    }
+    match d.get("Trnf") {
+        Some(Value::List(l)) if l.len() == 8 && l.iter().all(|v| matches!(v, Value::Double(_))) => {}
+        _ => return Err(PsdError::invalid("Trnf is not eight doubles")),
+    }
+    let Some(fx) = d.get("filterFX") else { return Ok(()) };
+    let Value::Descriptor(fx) = fx else { return Err(PsdError::invalid("filterFX is not an object")) };
+    let Some(Value::List(list)) = fx.get("filterFXList") else { return Err(PsdError::invalid("filterFX has no filterFXList")) };
+    for (i, item) in list.iter().enumerate() {
+        let Value::Descriptor(f) = item else { return Err(PsdError::invalid(format!("filter {i} is not an object"))) };
+        let ok = matches!(f.get("Nm  "), Some(Value::Text(_)))
+            && matches!(f.get("blendOptions"), Some(Value::Descriptor(_)))
+            && matches!(f.get("enab"), Some(Value::Boolean(_)))
+            && matches!(f.get("filterID"), Some(Value::Integer(_)))
+            && f.get("Fltr").is_none_or(|v| matches!(v, Value::Descriptor(_)));
+        if !ok {
+            return Err(PsdError::invalid(format!("filter {i} lacks Nm/blendOptions/enab/filterID")));
+        }
+    }
+    Ok(())
+}
+
+/// Strict check of one embedded (`liFD`) linked-layer item: type, version, unique id, file name,
+/// file type and creator, data length, optional open descriptor, then the file data, which must
+/// fit in the item (version 5+ fields follow it).
+fn check_embedded_item(item: &[u8]) -> Result<()> {
+    let mut r = Reader::new(item);
+    r.skip(4)?;
+    let version = r.u32()?;
+    if !(1..=16).contains(&version) {
+        return Err(PsdError::invalid(format!("version {version}")));
+    }
+    crate::io::read_pascal(&mut r, 1)?;
+    crate::io::read_unicode_units(&mut r)?;
+    r.skip(8)?; // file type, creator
+    let len = r.u64()?;
+    if r.u8()? != 0 {
+        crate::descriptor::VersionedDescriptor::read(&mut r)?;
+    }
+    r.bytes_u64(len)?;
+    Ok(())
+}
+
+fn expect_kind(r: &mut Reader<'_>, kind: &'static [u8; 4]) -> Result<()> {
+    let found = r.array::<4>()?;
+    if &found != kind {
+        return Err(PsdError::invalid(format!("expected {} structure, found {:?}", String::from_utf8_lossy(kind), String::from_utf8_lossy(&found))));
+    }
+    Ok(())
+}
+
 fn parse_section(d: &[u8]) -> Result<SectionDivider> {
     let mut r = Reader::new(d);
     let kind = SectionType::from_u32(r.u32()?);
@@ -256,8 +419,10 @@ fn parse_section(d: &[u8]) -> Result<SectionDivider> {
     Ok(SectionDivider { kind, blend_mode, sub_type })
 }
 
+/// `8BIM` / `8B64`, or the markers `MIB8` / `46B8` that [`crate::tiff`] gives a block kept
+/// verbatim from a little-endian TIFF when its layout is unknown (its data is in that order).
 fn is_sig(b: &[u8]) -> bool {
-    b.starts_with(b"8BIM") || b.starts_with(b"8B64")
+    b.starts_with(b"8BIM") || b.starts_with(b"8B64") || TaggedBlock::is_foreign_order_signature(b)
 }
 
 /// Reads tagged blocks until the reader is exhausted. Bytes that do not form
@@ -363,6 +528,11 @@ mod tests {
         assert_eq!(TaggedBlock::blend_clipped_as_group(true).parsed(), Some(Ok(BlockData::BlendClippedAsGroup(true))));
         assert_eq!(TaggedBlock::blend_interior_elements(false).parsed(), Some(Ok(BlockData::BlendInteriorElements(false))));
         assert_eq!(TaggedBlock::knockout(2).parsed(), Some(Ok(BlockData::Knockout(2))));
+        assert_eq!(TaggedBlock::transparency_shapes(false).parsed(), Some(Ok(BlockData::TransparencyShapes(false))));
+        assert_eq!(TaggedBlock::layer_mask_hides_effects(true).parsed(), Some(Ok(BlockData::LayerMaskHidesEffects(true))));
+        assert_eq!(TaggedBlock::vector_mask_hides_effects(true).parsed(), Some(Ok(BlockData::VectorMaskHidesEffects(true))));
+        assert_eq!(TaggedBlock::vector_mask_hides_effects(true).data, vec![1, 0, 0, 0]);
+        assert!(matches!(TaggedBlock::new(*b"tsly", vec![]).parsed(), Some(Err(_))), "truncated flag is an error, not a panic");
         assert_eq!(TaggedBlock::protection(0x8000_0000).parsed(), Some(Ok(BlockData::Protection(0x8000_0000))));
         assert_eq!(TaggedBlock::sheet_color(3).parsed(), Some(Ok(BlockData::SheetColor(3))));
         assert_eq!(TaggedBlock::fill_opacity(128).parsed(), Some(Ok(BlockData::FillOpacity(128))));

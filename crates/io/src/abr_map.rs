@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use photocraft_paint::{
-    BrushPreset, BrushSettings, Control, DualBrush, Dynamic, GrayTile, MaskMode, Pattern, PatternStyle, Pose, ShapeDynamics, TipShape, Transfer,
+    BrushPreset, BrushSettings, Control, DualBrush, Dynamic, GrayTile, MaskMode, MixerSettings, Pattern, PatternStyle, Pose, ShapeDynamics, TipShape, Transfer,
 };
 use photocraft_psd::abr::{self, AbrFile, AbrSample, LegacyTip};
 use photocraft_psd::descriptor::{Descriptor, Value};
@@ -32,16 +32,39 @@ pub struct AbrImport {
 
 /// Parse an `.abr` file into presets in group `group` (usually the file name).
 pub fn read_abr(bytes: &[u8], group: &str) -> Result<AbrImport, String> {
+    read_abr_with(bytes, group, &photocraft_raster::Interrupt::NONE)
+}
+
+/// [`read_abr`] that checks `ctl` before each brush (and reports progress): a cancelled import
+/// fails with "cancelled".
+pub fn read_abr_with(bytes: &[u8], group: &str, ctl: &photocraft_raster::Interrupt) -> Result<AbrImport, String> {
     let f = abr::parse(bytes).map_err(|e| format!("not a readable Photoshop brush file: {e}"))?;
-    Ok(map_file(&f, group))
+    // Parsing is the small part; mapping (tip decoding) reports 10–100 %.
+    ctl.progress(0.1);
+    let cancel = || ctl.cancelled();
+    let progress = |p: f32| ctl.progress(0.1 + 0.9 * p);
+    map_file_with(&f, group, &photocraft_raster::Interrupt::new(&cancel, &progress)).map_err(|e| e.to_string())
 }
 
 /// Map a parsed file.
 pub fn map_file(f: &AbrFile, group: &str) -> AbrImport {
+    // Never cancelled, so always `Ok`.
+    map_file_with(f, group, &photocraft_raster::Interrupt::NONE).unwrap_or_default()
+}
+
+/// [`map_file`] that checks `ctl` before each brush.
+pub fn map_file_with(f: &AbrFile, group: &str, ctl: &photocraft_raster::Interrupt) -> Result<AbrImport, photocraft_raster::Cancelled> {
     let mut out = AbrImport { version: f.version, warnings: f.warnings.clone(), ..Default::default() };
     let mut m = Mapper { file: f, warnings: BTreeSet::new(), unknown: BTreeSet::new() };
+    let total = f.legacy.len().max(f.samples.len()).max(f.presets.len()).max(1) as f32;
+    let step = |i: usize| -> Result<(), photocraft_raster::Cancelled> {
+        ctl.check()?;
+        ctl.progress(i as f32 / total);
+        Ok(())
+    };
     if !f.legacy.is_empty() {
         for (i, b) in f.legacy.iter().enumerate() {
+            step(i)?;
             let spacing = if b.spacing == 0 { 0.25 } else { f32::from(b.spacing) / 100.0 };
             let base = BrushSettings { pressure_size: false, spacing, ..Default::default() };
             let (brush, default_name) = match &b.tip {
@@ -66,12 +89,14 @@ pub fn map_file(f: &AbrFile, group: &str) -> AbrImport {
     } else if f.presets.is_empty() {
         // Tips without a settings section (early v6 files): one preset per tip.
         for (i, s) in f.samples.iter().enumerate() {
+            step(i)?;
             let (tip, size) = m.tip(s);
             let brush = BrushSettings { pressure_size: false, spacing: 0.25, size, tip, ..Default::default() };
             out.presets.push(BrushPreset { name: format!("Sampled Brush {}", i + 1), brush, builtin: false, group: group.to_string() });
         }
     } else {
         for (i, d) in f.presets.iter().enumerate() {
+            step(i)?;
             let name = text(d, "Nm  ").filter(|n| !n.trim().is_empty()).map(|n| n.trim().to_string()).unwrap_or_else(|| format!("Brush {}", i + 1));
             match m.preset(d) {
                 Some(brush) => out.presets.push(BrushPreset { name, brush, builtin: false, group: group.to_string() }),
@@ -85,7 +110,8 @@ pub fn map_file(f: &AbrFile, group: &str) -> AbrImport {
     if !m.unknown.is_empty() {
         out.warnings.push(format!("settings without a PhotoCraft equivalent were ignored: {}", m.unknown.into_iter().collect::<Vec<_>>().join(", ")));
     }
-    out
+    ctl.progress(1.0);
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ descriptor helpers
@@ -281,6 +307,25 @@ impl Mapper<'_> {
         }
     }
 
+    /// Mixer Brush tool options captured with a preset (Wet, Load, Mix, Flow, Sample All Layers).
+    /// Key names are best effort (Photoshop doesn't document them); several spellings are read.
+    fn mixer_options(&mut self, to: &Descriptor, m: &mut MixerSettings) {
+        let first = |keys: &[&str]| keys.iter().find_map(|k| pct(to, k));
+        let wet = first(&["wetness", "Wtns", "wet"]);
+        let load = first(&["dryness", "load", "Ld  "]);
+        let mix = first(&["mix", "mixRatio", "Mx  "]);
+        if wet.is_none() && load.is_none() && mix.is_none() {
+            return;
+        }
+        m.wet = wet.unwrap_or(m.wet).clamp(0.0, 1.0);
+        m.load = load.unwrap_or(m.load).clamp(0.0, 1.0);
+        m.mix = mix.unwrap_or(m.mix).clamp(0.0, 1.0);
+        m.flow = pct(to, "flow").unwrap_or(m.flow).clamp(0.0, 1.0);
+        if let Some(v) = ["sampleMerged", "useAllLayers", "sampleAllLayers", "Mrgd"].iter().find_map(|k| boolean(to, k)) {
+            m.sample_all_layers = v;
+        }
+    }
+
     fn preset(&mut self, d: &Descriptor) -> Option<BrushSettings> {
         for (k, _) in &d.items {
             let k = String::from_utf8_lossy(k.as_bytes()).to_string();
@@ -298,8 +343,9 @@ impl Mapper<'_> {
             }
             b.angle = num(t, "Angl").unwrap_or(0.0) as f32;
             b.roundness = pct(t, "Rndn").unwrap_or(1.0).clamp(0.01, 1.0);
-            // `Intr` off = spacing unchecked (Photoshop spaces by pointer speed): keep it tight.
-            b.spacing = if boolean(t, "Intr") == Some(false) { 0.05 } else { pct(t, "Spcn").unwrap_or(0.25).clamp(0.01, 10.0) };
+            // `Intr` off = the Spacing checkbox is off: the pointer's speed sets the spacing.
+            b.spacing = pct(t, "Spcn").unwrap_or(0.25).clamp(0.01, 10.0);
+            b.spacing_enabled = boolean(t, "Intr") != Some(false);
             b.flip_x = boolean(t, "flipX").unwrap_or(false);
             b.flip_y = boolean(t, "flipY").unwrap_or(false);
         }
@@ -316,13 +362,9 @@ impl Mapper<'_> {
                 roundness,
                 flip_x_jitter: boolean(d, "flipX").unwrap_or(false),
                 flip_y_jitter: boolean(d, "flipY").unwrap_or(false),
+                tilt_scale: pct(d, "tiltScale").unwrap_or(0.0).clamp(0.0, 2.0),
+                brush_projection: boolean(d, "brushProjection").unwrap_or(false),
             };
-            if pct(d, "tiltScale").is_some_and(|v| v > 0.0) {
-                self.warnings.insert("Tilt Scale (Shape Dynamics) is not supported".into());
-            }
-            if boolean(d, "brushProjection") == Some(true) {
-                self.warnings.insert("Brush Projection is not supported".into());
-            }
         }
         // Scattering.
         if boolean(d, "useScatter") == Some(true) {
@@ -393,12 +435,13 @@ impl Mapper<'_> {
         }
         // Transfer.
         if boolean(d, "usePaintDynamics") == Some(true) {
-            b.transfer = Transfer { enabled: true, opacity: self.dynamic(obj(d, "opVr")), flow: self.dynamic(obj(d, "prVr")) };
-            for (k, what) in [("wtVr", "Wetness"), ("mxVr", "Mix")] {
-                if self.dynamic(obj(d, k)).is_active() {
-                    self.warnings.insert(format!("Transfer › {what} jitter (Mixer Brush) is not supported"));
-                }
-            }
+            b.transfer = Transfer {
+                enabled: true,
+                opacity: self.dynamic(obj(d, "opVr")),
+                flow: self.dynamic(obj(d, "prVr")),
+                wetness: self.dynamic(obj(d, "wtVr")),
+                mix: self.dynamic(obj(d, "mxVr")),
+            };
         }
         // Brush Pose (Photoshop's tilt is ±100 %; ours is ±90°).
         if boolean(d, "useBrushPose") == Some(true) {
@@ -443,6 +486,7 @@ impl Mapper<'_> {
             if let Some(v) = boolean(to, "smoothingZoomCompensation") {
                 b.smoothing.adjust_for_zoom = v;
             }
+            self.mixer_options(to, &mut b.mixer);
             if mask_blend_is_set(to) {
                 self.warnings.insert("tool blend modes stored with presets are not applied".into());
             }

@@ -13,6 +13,8 @@
 //! * Camera raws (DNG, CR2, uncompressed / lossless TIFF-EP raws) via
 //!   `photocraft-raw`, developed into a 16-bit ProPhoto RGB "Background"
 //!   layer; unsupported raw variants fall back to the embedded JPEG preview.
+//! * Layered TIFFs (Photoshop layer data in tags 37724 and 34377) open with their
+//!   layers through the PSD path and are written back the same way; see `tiff_layers`.
 //! * Every other format goes through `photocraft-codecs` as a single
 //!   "Background" layer (depth and Gray/RGB/CMYK model preserved).
 //!
@@ -33,12 +35,16 @@ mod gradient_bake;
 pub mod linked;
 mod multichannel_map;
 pub mod pattern_map;
-mod pixels;
+pub mod pixels;
 mod psd_export;
 mod psd_import;
 pub mod raw;
 pub mod slices_map;
+pub mod smart_map;
+pub mod svg;
+mod text_import;
 pub mod text_styles_map;
+pub mod tiff_layers;
 pub mod vector_map;
 
 use photocraft_codecs::{CodecError, EncodeOptions};
@@ -46,9 +52,9 @@ use photocraft_doc::Document;
 use photocraft_psd::{PsdError, PsdFile};
 
 pub use adjust_map::ADJUSTMENT_KEYS;
-pub use flat::document_to_image;
+pub use flat::{document_to_image, import_tiff_page};
 pub use psd_export::{PsdExportOptions, document_to_psd, document_to_psd_with};
-pub use psd_import::psd_to_document;
+pub use psd_import::{psd_to_document, psd_to_document_with};
 
 /// Errors from import/export.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +77,12 @@ pub enum IoError {
     /// Camera raw decode failure.
     #[error("{0}")]
     Raw(#[from] photocraft_raw::RawError),
+    /// An SVG that does not parse (or is too large to rasterise).
+    #[error("SVG: {0}")]
+    Svg(String),
+    /// A background import was cancelled ([`import_with`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Result of [`import`].
@@ -82,6 +94,14 @@ pub struct ImportResult {
     pub warnings: Vec<String>,
 }
 
+/// The import note for a file whose horizontal and vertical resolutions (`x`, `y`, in pixels per
+/// inch) differ: a document has one resolution, so it keeps the horizontal one and saves it on
+/// both axes (#1018). Differences under 0.01 ppi are below what the warning can show.
+pub(crate) fn unequal_resolution_warning(x: f64, y: f64) -> Option<String> {
+    ((x - y).abs() >= 0.01)
+        .then(|| format!("the vertical resolution ({y:.2} ppi) differs from the horizontal ({x:.2} ppi); the document keeps {x:.2} ppi for both"))
+}
+
 /// Result of [`export`].
 #[derive(Debug, Clone)]
 pub struct ExportResult {
@@ -91,13 +111,40 @@ pub struct ExportResult {
     pub warnings: Vec<String>,
 }
 
+/// Which part of the document's XMP packet a flat export embeds. Layered saves (PSD, PSB,
+/// `.pcraft`) always keep everything. Save As and conversions keep the whole packet, as
+/// Photoshop's Save As does; Export As starts at `None`, because the packet lists the text of
+/// every type layer and one id per placed document (#647).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XmpEmbed {
+    /// Embed the document's whole XMP packet.
+    #[default]
+    All,
+    /// Embed no XMP.
+    None,
+}
+
 /// Export options.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ExportOptions {
     /// Codec options for flat formats.
     pub encode: EncodeOptions,
     /// Write PSB even for `.psd` names when the document is small.
     pub force_psb: bool,
+    /// TIFF: keep the layers (Photoshop layer data in tag 37724). Off by default, so scripted
+    /// and agent saves (CLI, batch, MCP) write a flat TIFF unless they ask for layers; the app's
+    /// Save As sets it from its Layers option, which keeps them as Photoshop does. `false` is
+    /// Photoshop's "Discard Layers and Save a Copy".
+    pub tiff_layers: bool,
+    /// Which part of the document's XMP packet a flat export embeds (PSD/PSB/`.pcraft`
+    /// always keep everything). Everything by default, as Save As does; Export As offers None.
+    pub xmp: XmpEmbed,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        ExportOptions { encode: EncodeOptions::default(), force_psb: false, tiff_layers: false, xmp: XmpEmbed::All }
+    }
 }
 
 /// `true` if `bytes` start with the PSD/PSB signature.
@@ -108,23 +155,53 @@ pub fn is_psd(bytes: &[u8]) -> bool {
 /// Imports a file. PSD/PSB and camera raws are detected by magic; everything
 /// else is decoded with `photocraft-codecs`.
 pub fn import(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
-    if photocraft_format::is_pcraft(bytes) {
+    import_with(name, bytes, &photocraft_raster::Interrupt::NONE)
+}
+
+/// [`import`] for a background open: checks `ctl` between stages (and per layer for PSD/PSB) and
+/// reports progress. A cancelled import fails with [`IoError::Cancelled`].
+pub fn import_with(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt) -> Result<ImportResult, IoError> {
+    ctl.check().map_err(|_| IoError::Cancelled)?;
+    let r = import_stages(name, bytes, ctl)?;
+    ctl.check().map_err(|_| IoError::Cancelled)?;
+    ctl.progress(1.0);
+    Ok(r)
+}
+
+fn import_stages(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt) -> Result<ImportResult, IoError> {
+    // A declared native extension must reach its loader so malformed bundles retain format errors.
+    if has_extension(name, photocraft_format::EXTENSION) || photocraft_format::is_pcraft(bytes) {
         return Ok(ImportResult { document: photocraft_format::load_from_bytes(bytes)?, warnings: Vec::new() });
     }
     if is_psd(bytes) {
         let file = PsdFile::from_bytes(bytes)?;
-        let (mut document, warnings) = psd_to_document(&file);
+        // Nesting past the document model's cap could never be saved (.pcraft refuses it) and
+        // would overflow the importer's recursion; reject the file with the actionable limit.
+        if psd_import::group_depth(&file) > photocraft_doc::MAX_GROUP_DEPTH {
+            return Err(IoError::Unsupported(format!("layer groups nested deeper than {}", photocraft_doc::MAX_GROUP_DEPTH)));
+        }
+        ctl.check().map_err(|_| IoError::Cancelled)?;
+        ctl.progress(0.05);
+        let (mut document, warnings) = psd_import::psd_to_document_with(&file, ctl).ok_or(IoError::Cancelled)?;
         document.name = name.to_string();
+        text_import::prepare(&mut document);
         return Ok(ImportResult { document, warnings });
     }
     if raw::is_raw(bytes) {
         return raw::import_raw(name, bytes);
+    }
+    if has_extension(name, "svg") || has_extension(name, "svgz") || svg::is_svg(bytes) {
+        return svg::import_svg(name, bytes);
     }
     flat::import_flat(name, bytes)
 }
 
 fn extension(name_or_ext: &str) -> String {
     name_or_ext.rsplit(['.', '/', '\\']).next().unwrap_or(name_or_ext).to_ascii_lowercase()
+}
+
+fn has_extension(name: &str, expected: &str) -> bool {
+    name.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).is_some_and(|(base, ext)| !base.is_empty() && ext.eq_ignore_ascii_case(expected))
 }
 
 /// Exports `doc` to the format named by `name_or_ext` (a file name, path or
@@ -139,12 +216,18 @@ pub fn export(doc: &Document, name_or_ext: &str, opts: &ExportOptions) -> Result
         return Ok(ExportResult { bytes: photocraft_format::save_to_bytes(doc, &previews)?, warnings: Vec::new() });
     }
     if ext == "psd" || ext == "psb" {
-        let o = PsdExportOptions { force_psb: opts.force_psb || ext == "psb" };
-        let (file, warnings) = document_to_psd_with(doc, &o);
+        let o = PsdExportOptions { force_psb: opts.force_psb || ext == "psb", ..Default::default() };
+        let (mut file, mut warnings) = document_to_psd_with(doc, &o);
+        warnings.extend(tiff_layers::strip_foreign_order_blocks(&mut file));
+        // Never write a header the reader would refuse (e.g. a zero-sized canvas).
+        file.header.validate()?;
         let bytes = file.to_bytes()?;
         return Ok(ExportResult { bytes, warnings });
     }
     let format = photocraft_codecs::from_extension(&ext).ok_or_else(|| IoError::UnknownFormat(name_or_ext.to_string()))?;
+    if format == photocraft_codecs::Format::Tiff && opts.tiff_layers && tiff_layers::would_write_layers(doc) {
+        return tiff_layers::export_layered(doc, opts);
+    }
     flat::export_flat(doc, format, opts)
 }
 
@@ -167,7 +250,7 @@ pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
                 let mut v: [f32; 4] = std::array::from_fn(|i| f32::from(p[i]) / 255.0);
                 if unmatte {
                     for c in 0..3 {
-                        v[c] = pixels::unmatte(v[c], v[3], 1.0);
+                        v[c] = pixels::unmatte(v[c], v[3], 1.0).clamp(0.0, 1.0);
                     }
                 }
                 v
@@ -176,6 +259,10 @@ pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
     }
     // Generic path (Lab, CMYK and others) via the raster model conversion.
     let (doc, _) = psd_to_document(&PsdFile { layer_info: None, ..file.clone() });
+    // Multichannel documents keep their channels apart (no layer): composite them.
+    if doc.layers.is_empty() && doc.mode == photocraft_color::ColorMode::Multichannel {
+        return Ok(photocraft_compose::flatten(&doc).px);
+    }
     let l = doc.layers.first().ok_or_else(|| IoError::Unsupported("no merged image".into()))?;
     let s = l.surface().ok_or_else(|| IoError::Unsupported("no merged image".into()))?;
     Ok(photocraft_compose::surface_to_buffer(s, doc.bounds()).px)

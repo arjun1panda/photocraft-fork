@@ -13,6 +13,15 @@ use crate::{Dab, StrokePoint};
 /// Maximum pulled-string length at 100 % smoothing, in screen pixels.
 pub const MAX_STRING_PX: f64 = 100.0;
 
+/// With Spacing unchecked, one dab per this many milliseconds of stroke time, so faster strokes
+/// space their dabs further apart (Photoshop: "the speed of the cursor determines the spacing").
+pub const SPEED_SPACING_MS: f64 = 8.0;
+
+/// Densest speed spacing, in pixels between dabs (a slow, long stroke never floods the buffer).
+const MIN_SPEED_STEP: f64 = 0.5;
+/// Maximum airbrush catch-up dabs for one input segment.
+const MAX_AIRBRUSH_DABS_PER_SEGMENT: usize = 512;
+
 #[inline]
 fn lerp_pt(a: &StrokePoint, b: &StrokePoint, f: f64) -> StrokePoint {
     let ff = f as f32;
@@ -147,11 +156,32 @@ pub struct PathWalker {
     /// Airbrush interval in ms (None = off).
     interval: Option<f64>,
     time_acc: f64,
+    /// Speed spacing (Spacing unchecked): one step per this many ms of stroke time.
+    speed: Option<f64>,
+    speed_acc: f64,
 }
 
 impl PathWalker {
     pub fn new(build_up_interval_ms: Option<f64>) -> Self {
-        Self { last: None, next_at: 0.0, pending_first: None, initial_dir: None, dir: 0.0, step: 0, interval: build_up_interval_ms, time_acc: 0.0 }
+        Self {
+            last: None,
+            next_at: 0.0,
+            pending_first: None,
+            initial_dir: None,
+            dir: 0.0,
+            step: 0,
+            interval: build_up_interval_ms,
+            time_acc: 0.0,
+            speed: None,
+            speed_acc: 0.0,
+        }
+    }
+
+    /// Space steps by stroke time instead of distance ([`SPEED_SPACING_MS`]): faster movement
+    /// spreads them out. Segments without timestamps are spaced by distance.
+    pub fn speed_spacing(mut self, interval_ms: f64) -> Self {
+        self.speed = Some(interval_ms.max(0.1));
+        self
     }
 
     fn emit(&mut self, point: StrokePoint, out: &mut impl FnMut(StepInput)) {
@@ -179,21 +209,51 @@ impl PathWalker {
             self.emit(f, out);
         }
         if len > 1e-9 {
-            while self.next_at <= len + 1e-9 {
-                let q = lerp_pt(&a, &p, (self.next_at / len).min(1.0));
-                self.emit(q, out);
-                self.next_at += step_len(&q).max(0.25);
+            // Speed spacing needs the segment's duration; without timestamps (a straight ⇧-click
+            // line, or input that carries no times) the segment is spaced by distance instead.
+            let dt = p.time - a.time;
+            match self.speed.filter(|_| dt > 0.0 && dt.is_finite()) {
+                None => {
+                    while self.next_at <= len + 1e-9 {
+                        let q = lerp_pt(&a, &p, (self.next_at / len).min(1.0));
+                        self.emit(q, out);
+                        self.next_at += step_len(&q).max(0.25);
+                    }
+                    self.next_at -= len;
+                }
+                Some(iv) => {
+                    self.speed_acc += dt;
+                    let max_n = (len / MIN_SPEED_STEP).ceil().max(1.0) as usize;
+                    let mut n = 0;
+                    while self.speed_acc >= iv && n < max_n {
+                        self.speed_acc -= iv;
+                        let f = ((dt - self.speed_acc) / dt).clamp(0.0, 1.0);
+                        self.emit(lerp_pt(&a, &p, f), out);
+                        n += 1;
+                    }
+                    if n == max_n {
+                        self.speed_acc = self.speed_acc.rem_euclid(iv);
+                    }
+                }
             }
-            self.next_at -= len;
         }
         if let Some(iv) = self.interval {
             let dt = p.time - a.time;
-            if dt > 0.0 {
+            if dt > 0.0 && dt.is_finite() {
+                if dt > iv * MAX_AIRBRUSH_DABS_PER_SEGMENT as f64 {
+                    // A stalled or hostile timestamp must not replay an arbitrarily long backlog.
+                    self.time_acc = 0.0;
+                    self.emit(p, out);
+                    self.last = Some(p);
+                    return;
+                }
                 self.time_acc += dt;
-                while self.time_acc >= iv {
+                let mut n = 0;
+                while self.time_acc >= iv && n < MAX_AIRBRUSH_DABS_PER_SEGMENT {
                     self.time_acc -= iv;
                     let f = ((dt - self.time_acc) / dt).clamp(0.0, 1.0);
                     self.emit(lerp_pt(&a, &p, f), out);
+                    n += 1;
                 }
             }
         }
@@ -379,6 +439,22 @@ impl DabBuilder {
                     fy = !fy;
                 }
             }
+            // Tilt Scale and Brush Projection (Shape Dynamics).
+            let (mut proj_angle, mut proj_scale) = (0.0, 1.0);
+            if sd.enabled {
+                let tilt = s.point.tilt_x.hypot(s.point.tilt_y).clamp(0.0, 90.0);
+                if sd.size.control == Control::PenTilt && sd.tilt_scale > 0.0 {
+                    let k = 1.0 - sd.tilt_scale.clamp(0.0, 2.0) * 0.5 * tilt / 90.0;
+                    roundness = (roundness * k).clamp(0.01, 1.0);
+                }
+                if sd.brush_projection {
+                    angle += s.point.rotation;
+                    if tilt > 0.0 {
+                        proj_angle = (-s.point.tilt_y).atan2(s.point.tilt_x);
+                        proj_scale = tilt.to_radians().cos().max(0.05);
+                    }
+                }
+            }
             let radius = (diameter / 2.0).max(0.5);
             // Scatter.
             let mut c = Point::new(s.point.x, s.point.y);
@@ -403,6 +479,7 @@ impl DabBuilder {
                 opacity = scalar(&tr.opacity, s, r(stream::OPACITY));
                 flow *= scalar(&tr.flow, s, r(stream::FLOW));
             }
+            let (wet, mix) = if tr.enabled { (scalar(&tr.wetness, s, r(stream::WET)), scalar(&tr.mix, s, r(stream::MIX))) } else { (1.0, 1.0) };
             if b.pressure_opacity && !(tr.enabled && tr.opacity.control != Control::Off) {
                 opacity *= s.point.pressure.clamp(0.0, 1.0);
             }
@@ -428,6 +505,10 @@ impl DabBuilder {
                 color,
                 depth,
                 index: i,
+                proj_angle,
+                proj_scale,
+                wet,
+                mix,
             });
         }
     }
@@ -479,6 +560,10 @@ impl DualBuilder {
                 color: [0.0, 0.0, 0.0, 1.0],
                 depth: 1.0,
                 index: i,
+                proj_angle: 0.0,
+                proj_scale: 1.0,
+                wet: 1.0,
+                mix: 1.0,
             });
         }
     }
@@ -515,14 +600,15 @@ pub struct DabGenerator {
 
 impl DabGenerator {
     pub fn new(brush: &BrushSettings, zoom: f32) -> Self {
+        let brush = brush.bounded_for_render();
         let interval = brush.build_up.then(|| 1000.0 / f64::from(brush.build_up_rate.clamp(0.1, 1000.0)));
         let dual_on = brush.dual_brush.enabled;
         Self {
             smoother: Smoother::new(&brush.smoothing, zoom),
-            walker: PathWalker::new(interval),
+            walker: if brush.spacing_enabled { PathWalker::new(interval) } else { PathWalker::new(interval).speed_spacing(SPEED_SPACING_MS) },
             dual_walker: dual_on.then(|| PathWalker::new(None)),
-            builder: DabBuilder::new(brush),
-            dual: dual_on.then(|| DualBuilder::new(brush)),
+            builder: DabBuilder::new(&brush),
+            dual: dual_on.then(|| DualBuilder::new(&brush)),
             scratch: Vec::new(),
         }
     }

@@ -112,17 +112,19 @@ fn pixel_layer(s: &Session) -> std::result::Result<LayerId, String> {
     let id = d.active_layer.ok_or("no active layer")?;
     let l = d.doc.layer(id).ok_or("no active layer")?;
     if !matches!(l.content, LayerContent::Raster(_)) {
-        return Err(format!("active layer is a {} layer, not a pixel layer", l.content.kind_name()));
+        return Err(format!("active layer is {} {} layer, not a pixel layer", l.content.article(), l.content.kind_name()));
     }
-    if l.locks.all || l.locks.pixels {
+    let locks = d.doc.effective_locks(id);
+    if locks.all || locks.pixels {
         return Err(format!("the layer \"{}\" is locked", l.name));
     }
     Ok(id)
 }
 
 fn writable_surface(doc: &mut Document, id: LayerId) -> Result<&mut Surface> {
+    let locks = doc.effective_locks(id);
     let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-    if l.locks.all || l.locks.pixels {
+    if locks.all || locks.pixels {
         return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", l.name)));
     }
     l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))
@@ -303,15 +305,34 @@ fn channel_mask<'a>(doc: &'a Document, v: &Value) -> Option<&'a Surface> {
     }
 }
 
-fn rect_param(p: &Value, key: &str) -> Option<Rect> {
-    let a = p.get(key)?.as_array()?;
-    let n = |i: usize| a.get(i).and_then(Value::as_f64).map(|v| v.round() as i32);
-    Some(Rect::new(n(0)?, n(1)?, n(0)? + n(2)?.max(0), n(1)? + n(3)?.max(0)))
+/// `key` as an `[x, y, w, h]` rectangle. The saturating float→int casts bound each component;
+/// the additions saturate too — `area: [1e30, 0, 1e30, 10]` is a whole-canvas window, not an
+/// overflow (it panicked in debug builds before the `saturating_add`).
+fn rect_param(p: &Value, key: &str, cmd: &str) -> Result<Rect> {
+    let a = p.get(key).and_then(Value::as_array).ok_or_else(|| bad(cmd, format!("`{key}` must be [x, y, w, h]")))?;
+    let n = |i: usize| {
+        a.get(i)
+            .and_then(Value::as_f64)
+            .filter(|f| f.is_finite())
+            .map(|v| v.round() as i32)
+            .ok_or_else(|| bad(cmd, format!("`{key}` must be four finite numbers")))
+    };
+    let (x, y, w, h) = (n(0)?, n(1)?, n(2)?, n(3)?);
+    Ok(Rect::new(x, y, x.saturating_add(w.max(0)), y.saturating_add(h.max(0))))
 }
 
 fn content_aware_fill(s: &mut Session, p: &Value) -> Result<Value> {
-    use photocraft_algo::content_aware::{FillOptions, color_level, fill, rotation_level};
-    let cmd = "edit.contentAwareFill";
+    content_aware_fill_as(s, p, "edit.contentAwareFill", "Content-Aware Fill")
+}
+
+/// Delete and Fill Selection (#1286): Photoshop's one-click removal from the selection-tool
+/// context menu. Content-Aware Fill with its default settings into the layer, no dialog.
+fn delete_and_fill(s: &mut Session, _: &Value) -> Result<Value> {
+    content_aware_fill_as(s, &json!({}), "edit.deleteAndFillSelection", "Delete and Fill Selection")
+}
+
+fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &'static str) -> Result<Value> {
+    use photocraft_algo::content_aware::{FillOptions, color_level, fill_with, rotation_level};
     let id = pixel_layer(s).map_err(EngineError::Other)?;
     let st = s.active().ok_or(EngineError::NoDocument)?;
     let doc = st.doc.clone();
@@ -320,15 +341,16 @@ fn content_aware_fill(s: &mut Session, p: &Value) -> Result<Value> {
     if hb.is_empty() {
         return Err(bad(cmd, "the selection is outside the canvas"));
     }
-    let ext = hb.width().max(hb.height()) as i32;
-    let sampling = str_or(p, "sampling", "auto");
-    let custom_mask = p.get("channel").and_then(|v| channel_mask(&doc, v));
-    let custom_rect = rect_param(p, "area");
-    let window = match sampling {
-        "auto" => hb.inflate((ext * 3 / 4).max(32)),
+    // The canvas is at most i32 wide, so the extent fits; saturate anyway rather than wrap (#963).
+    let ext = i32::try_from(hb.width().max(hb.height())).unwrap_or(i32::MAX);
+    let sampling = str_or(p, "sampling", "auto").to_string();
+    let custom_mask: Option<Surface> = p.get("channel").and_then(|v| channel_mask(&doc, v)).cloned();
+    let custom_rect = if p.get("area").is_some() { Some(rect_param(p, "area", cmd)?) } else { None };
+    let window = match sampling.as_str() {
+        "auto" => hb.inflate(crate::fill_cmds::sampling_margin(hb)),
         "rectangular" => hb.inflate(int(p, "margin").map_or(ext.max(16), |m| m.clamp(0, 100_000) as i32)),
         "custom" => {
-            let r = match (custom_rect, custom_mask) {
+            let r = match (custom_rect, custom_mask.as_ref()) {
                 (Some(r), _) => r,
                 (None, Some(m)) => m.content_bounds(),
                 (None, None) => return Err(bad(cmd, "custom sampling needs `area` [x,y,w,h] or `channel` (alpha channel index or name)")),
@@ -352,31 +374,67 @@ fn content_aware_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
     let fmt = surf.format();
     let n = fmt.channels();
-    let (w, h) = (window.width() as usize, window.height() as usize);
-    let img = surf.read_region(window);
-    let mut cover = vec![0.0f32; w * h];
-    let mut hole = vec![false; w * h];
-    let mut source = vec![true; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let (dx, dy) = (window.x0 + x as i32, window.y0 + y as i32);
-            let i = y * w + x;
-            cover[i] = sel.sample_channel(dx, dy, 0);
-            hole[i] = cover[i] > 0.0;
-            if sampling == "custom" {
-                source[i] = match (custom_rect, custom_mask) {
-                    (Some(r), _) => r.contains(dx, dy),
-                    (None, Some(m)) => m.sample_channel(dx, dy, 0) > 0.5,
-                    _ => true,
-                };
+    // Refuse a window too large to read before allocating for it, whatever the sampling (#963).
+    let (w, h) = crate::fill_cmds::window_size(window)?;
+    // A background job when started with `Session::start` (#210): reading the window and the
+    // PatchMatch fill run on a worker against the document snapshot, cancellable per row band.
+    crate::jobs::run(
+        s,
+        label,
+        true,
+        move |ctx| {
+            ctx.progress(0.0, label);
+            let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
+            let img = surf.read_region(window);
+            let mut cover = vec![0.0f32; w * h];
+            let mut hole = vec![false; w * h];
+            let mut source = vec![true; w * h];
+            for y in 0..h {
+                if y % 64 == 0 {
+                    ctx.check()?;
+                }
+                for x in 0..w {
+                    let (dx, dy) = (window.x0 + x as i32, window.y0 + y as i32);
+                    let i = y * w + x;
+                    cover[i] = sel.sample_channel(dx, dy, 0);
+                    hole[i] = cover[i] > 0.0;
+                    if sampling == "custom" {
+                        source[i] = match (custom_rect, custom_mask.as_ref()) {
+                            (Some(r), _) => r.contains(dx, dy),
+                            (None, Some(m)) => m.sample_channel(dx, dy, 0) > 0.5,
+                            _ => true,
+                        };
+                    }
+                }
             }
-        }
-    }
-    let filled = fill(w, h, n, &img, &hole, &source, &opts);
+            ctx.check()?;
+            let filled = ctx.stage(0.05, 1.0, label, |ctl| fill_with(w, h, n, &img, &hole, &source, &opts, ctl)).map_err(|_| EngineError::Cancelled)?;
+            Ok((img, cover, hole, filled))
+        },
+        move |s, (img, cover, hole, filled)| apply_content_aware_fill(s, label, id, &output, fmt, window, &img, &cover, &hole, &filled),
+    )
+}
+
+/// Write a Content-Aware Fill result (the job's apply step): into the layer, a new layer or a
+/// duplicate, as one undo step.
+#[allow(clippy::too_many_arguments)]
+fn apply_content_aware_fill(
+    s: &mut Session,
+    label: &str,
+    id: LayerId,
+    output: &str,
+    fmt: PixelFormat,
+    window: Rect,
+    img: &[f32],
+    cover: &[f32],
+    hole: &[bool],
+    filled: &[f32],
+) -> Result<Value> {
+    let n = fmt.channels();
+    let (w, h) = (window.width() as usize, window.height() as usize);
     let n_hole = hole.iter().filter(|h| **h).count();
-    let label = "Content-Aware Fill";
     let layer = s.edit(label, |doc, active| {
-        let target = match output.as_str() {
+        let target = match output {
             "new" => {
                 let mut l = Layer::raster(doc.next_layer_name("Content-Aware Fill"), PixelFormat { alpha: true, ..fmt });
                 let mut px = vec![0.0f32; w * h * n.max(1)];
@@ -401,7 +459,7 @@ fn content_aware_fill(s: &mut Session, p: &Value) -> Result<Value> {
             }
             "duplicate" => {
                 let mut dup = doc.layer(id).ok_or(EngineError::NoLayer(id))?.duplicate();
-                dup.name = format!("{} copy", dup.name);
+                dup.name = doc.copy_name(&dup.name);
                 let nid = doc.insert_above(Some(id), dup);
                 *active = Some(nid);
                 nid
@@ -409,7 +467,7 @@ fn content_aware_fill(s: &mut Session, p: &Value) -> Result<Value> {
             _ => id,
         };
         let surf = writable_surface(doc, target)?;
-        let mut out = img.clone();
+        let mut out = img.to_vec();
         for (i, &k) in cover.iter().enumerate() {
             if k > 0.0 {
                 for c in 0..n {
@@ -427,7 +485,7 @@ fn content_aware_fill(s: &mut Session, p: &Value) -> Result<Value> {
 // ------------------------------------------------------------------ Content-Aware Scale
 
 fn content_aware_scale(s: &mut Session, p: &Value) -> Result<Value> {
-    use photocraft_algo::seam::{carve, resize_bilinear, skin_mask};
+    use photocraft_algo::seam::{carve_with, resize_bilinear, skin_mask};
     let cmd = "edit.contentAwareScale";
     let id = pixel_layer(s).map_err(EngineError::Other)?;
     let st = s.active().ok_or(EngineError::NoDocument)?;
@@ -456,38 +514,58 @@ fn content_aware_scale(s: &mut Session, p: &Value) -> Result<Value> {
     let amount = f32_or(p, "amount", 100.0).clamp(0.0, 100.0) / 100.0;
     let fmt = surf.format();
     let n = fmt.channels();
-    let img = surf.read_region(region);
     // Protection: an alpha channel and/or skin tones.
-    let mut protect: Option<Vec<f32>> = None;
-    if let Some(m) = p.get("protect").filter(|v| !v.is_null() && v.as_str() != Some("none")).and_then(|v| channel_mask(&doc, v)) {
-        protect = Some((0..w * h).map(|i| m.sample_channel(region.x0 + (i % w) as i32, region.y0 + (i / w) as i32, 0)).collect());
-    } else if p.get("protect").is_some_and(|v| !v.is_null() && v.as_str() != Some("none")) {
-        return Err(bad(cmd, "`protect` must name an alpha channel (index or name) or \"none\""));
-    }
-    if bool_or(p, "protectSkinTones", false) {
-        let rgba: Vec<f32> = img.chunks_exact(n).flat_map(|px| to_rgba(&fmt, px)).collect();
-        let skin = skin_mask(w, h, 4, &rgba);
-        protect = Some(match protect {
-            Some(pm) => pm.iter().zip(&skin).map(|(a, b)| a.max(*b)).collect(),
-            None => skin,
-        });
-    }
-    let carved = if amount > 0.0 { carve(w, h, n, &img, protect.as_deref(), nw, nh) } else { Vec::new() };
-    let plain = if amount < 1.0 { resize_bilinear(w, h, n, &img, nw, nh) } else { Vec::new() };
-    let out: Vec<f32> = match (carved.is_empty(), plain.is_empty()) {
-        (false, true) => carved,
-        (true, false) => plain,
-        _ => carved.iter().zip(&plain).map(|(c, l)| l + (c - l) * amount).collect(),
+    let protect_mask: Option<Surface> = match p.get("protect").filter(|v| !v.is_null() && v.as_str() != Some("none")) {
+        Some(v) => Some(channel_mask(&doc, v).cloned().ok_or_else(|| bad(cmd, "`protect` must name an alpha channel (index or name) or \"none\""))?),
+        None => None,
     };
+    let skin_tones = bool_or(p, "protectSkinTones", false);
     let dst = Rect::from_xywh(region.x0, region.y0, nw as u32, nh as u32);
-    s.edit("Content-Aware Scale", |doc, _| {
-        let surf = writable_surface(doc, id)?;
-        crate::pixels::clear_surface(surf, region, None);
-        surf.write_region(dst, &out);
-        surf.prune();
-        Ok(())
-    })?;
-    Ok(json!({"from": [w, h], "to": [nw, nh], "bounds": [dst.x0, dst.y0, nw, nh]}))
+    let label = "Content-Aware Scale";
+    // A background job when started with `Session::start` (#210): seam carving runs on a worker
+    // against the document snapshot and checks for cancellation before every seam.
+    crate::jobs::run(
+        s,
+        label,
+        true,
+        move |ctx| {
+            ctx.progress(0.0, label);
+            let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
+            let img = surf.read_region(region);
+            let mut protect: Option<Vec<f32>> =
+                protect_mask.map(|m| (0..w * h).map(|i| m.sample_channel(region.x0 + (i % w) as i32, region.y0 + (i / w) as i32, 0)).collect());
+            if skin_tones {
+                let rgba: Vec<f32> = img.chunks_exact(n).flat_map(|px| to_rgba(&fmt, px)).collect();
+                let skin = skin_mask(w, h, 4, &rgba);
+                protect = Some(match protect {
+                    Some(pm) => pm.iter().zip(&skin).map(|(a, b)| a.max(*b)).collect(),
+                    None => skin,
+                });
+            }
+            ctx.check()?;
+            let carved = if amount > 0.0 {
+                ctx.stage(0.05, 0.95, label, |ctl| carve_with(w, h, n, &img, protect.as_deref(), nw, nh, ctl)).map_err(|_| EngineError::Cancelled)?
+            } else {
+                Vec::new()
+            };
+            let plain = if amount < 1.0 { resize_bilinear(w, h, n, &img, nw, nh) } else { Vec::new() };
+            Ok(match (carved.is_empty(), plain.is_empty()) {
+                (false, true) => carved,
+                (true, false) => plain,
+                _ => carved.iter().zip(&plain).map(|(c, l)| l + (c - l) * amount).collect::<Vec<f32>>(),
+            })
+        },
+        move |s, out| {
+            s.edit(label, |doc, _| {
+                let surf = writable_surface(doc, id)?;
+                crate::pixels::clear_surface(surf, region, None);
+                surf.write_region(dst, &out);
+                surf.prune();
+                Ok(())
+            })?;
+            Ok(json!({"from": [w, h], "to": [nw, nh], "bounds": [dst.x0, dst.y0, nw, nh]}))
+        },
+    )
 }
 
 // ------------------------------------------------------------------ Define Brush / Custom Shape
@@ -591,7 +669,7 @@ pub fn find_matches(text: &str, find: &str, case: bool, whole: bool) -> Vec<(usi
 fn type_layers(doc: &Document, forward: bool) -> Vec<LayerId> {
     // Layers panel order: top first.
     let mut ids: Vec<LayerId> =
-        doc.walk().into_iter().rev().filter(|(_, _, l)| matches!(l.content, LayerContent::Text(_)) && !l.locks.all).map(|(_, _, l)| l.id).collect();
+        doc.walk().into_iter().rev().filter(|(p, _, l)| matches!(l.content, LayerContent::Text(_)) && !doc.locks_at(p).all).map(|(_, _, l)| l.id).collect();
     if !forward {
         ids.reverse();
     }
@@ -674,7 +752,8 @@ fn find_replace(s: &mut Session, p: &Value) -> Result<Value> {
             let cursor = s.edit_state.find_cursor;
             let start = cursor.and_then(|(id, _, _)| layers.iter().position(|l| *l == id)).unwrap_or(0);
             for k in 0..=layers.len() {
-                let id = layers[(start + k) % layers.len().max(1)];
+                // `allLayers: false` with a non-type layer active leaves no layers to search (#703).
+                let Some(&id) = layers.get((start + k) % layers.len().max(1)) else { break };
                 let Some(text) = text_of(&doc, id) else { continue };
                 let ms = find_matches(&text, &find, case, whole);
                 let hit = match (k, cursor) {
@@ -720,13 +799,6 @@ fn preset_names(s: &Session, kind: &str) -> Option<Vec<String>> {
         "patterns" => s.patterns.items.iter().map(|p| p.name.clone()).collect(),
         _ => return None,
     })
-}
-
-/// Move item `i` of `v` to position `to`.
-fn move_item<T>(v: &mut Vec<T>, i: usize, to: usize) {
-    let x = v.remove(i);
-    let to = to.min(v.len());
-    v.insert(to, x);
 }
 
 fn preset_index(s: &Session, kind: &str, p: &Value) -> Result<usize> {
@@ -777,10 +849,10 @@ fn preset_manager(s: &mut Session, p: &Value) -> Result<Value> {
         "move" => {
             let to = p.get("to").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "missing `to`"))? as usize;
             match kind.as_str() {
-                "brushes" => move_item(&mut s.tools.presets, i, to),
-                "patterns" => move_item(&mut s.patterns.items, i, to),
-                _ => move_item(&mut s.edit_state.custom_shapes, i, to),
-            }
+                "brushes" => crate::move_item(&mut s.tools.presets, i, to),
+                "patterns" => crate::move_item(&mut s.patterns.items, i, to),
+                _ => crate::move_item(&mut s.edit_state.custom_shapes, i, to),
+            };
         }
         other => return Err(bad(cmd, format!("unknown action `{other}` (list|rename|delete|move)"))),
     }
@@ -895,6 +967,7 @@ pub fn specs() -> Vec<CommandSpec> {
             can_caf,
             content_aware_fill
         ),
+        spec!("edit.deleteAndFillSelection", "Delete and Fill Selection", [], None, "{}", can_caf, delete_and_fill),
         spec!(
             "edit.contentAwareScale",
             "Content-Aware Scale",

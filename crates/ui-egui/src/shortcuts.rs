@@ -33,7 +33,9 @@ pub fn parse(s: &str) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(mods, key?))
 }
 
-/// Human-readable form for menus.
+/// Human-readable form for menus, tooltips and inline hints (`Cmd+Shift+N` → `⌘⇧N` on
+/// macOS, `Ctrl+Shift+N` elsewhere). Works for lone keys too: `pretty("Alt")` is `⌥`/`Alt`,
+/// `pretty("Enter")` is `↩`/`Enter`.
 pub fn pretty(s: &str) -> String {
     let mac = cfg!(target_os = "macos");
     s.split('+')
@@ -42,10 +44,49 @@ pub fn pretty(s: &str) -> String {
             ("Cmd", false) => "Ctrl".to_string(),
             ("Shift", true) => "⇧".to_string(),
             ("Alt", true) => "⌥".to_string(),
+            ("Enter", true) => "↩".to_string(),
+            ("Delete", true) => "⌫".to_string(),
             (other, _) => other.to_string(),
         })
         .collect::<Vec<_>>()
         .join(if mac { "" } else { "+" })
+}
+
+/// The command's effective shortcut in the platform's notation (`Ctrl+N`), or `None` when
+/// the command has no binding (the user removed it in Edit › Keyboard Shortcuts).
+pub fn shortcut_label(app: &PhotocraftApp, command: &str) -> Option<String> {
+    effective_shortcut(app, command, default_shortcut(command).as_deref()).map(|s| pretty(&s))
+}
+
+/// `label` (English, shown in the UI language) followed by the command's effective shortcut
+/// (`New document…     Ctrl+N`); bare `label` when the binding was removed.
+pub fn command_label(app: &PhotocraftApp, label: &str, command: &str) -> String {
+    let label = tl!(label);
+    shortcut_label(app, command).map_or_else(|| label.to_string(), |sc| format!("{label}     {sc}"))
+}
+
+/// `label` (English, shown in the UI language) with the command's effective shortcut in
+/// parentheses (`Rulers  (Ctrl+R)`); bare `label` when the binding was removed.
+pub fn tip_label(app: &PhotocraftApp, label: &str, command: &str) -> String {
+    let label = tl!(label);
+    shortcut_label(app, command).map_or_else(|| label.to_string(), |sc| format!("{label}  ({sc})"))
+}
+
+/// The shortcut in effect for a command: the user's override, else `default`.
+pub fn effective_shortcut(app: &PhotocraftApp, id: &str, default: Option<&str>) -> Option<String> {
+    app.session.prefs().shortcut(id, default).map(str::to_string)
+}
+
+/// Default (unmodified) shortcut of a command id.
+pub fn default_shortcut(id: &str) -> Option<String> {
+    crate::menus::UI_COMMANDS
+        .iter()
+        .find(|c| c.0 == id)
+        .and_then(|c| c.3)
+        .or_else(|| photocraft_engine::commands::find(id).and_then(|c| c.shortcut))
+        .or_else(|| crate::menu_catalog::CATALOG.iter().find(|c| c.3 == id).and_then(|c| c.2))
+        .or_else(|| photocraft_engine::prefs::TEMPORARY_TOOLS.iter().find(|t| t.0 == id).map(|t| t.2))
+        .map(str::to_string)
 }
 
 /// With ⇧ held the OS reports the shifted character as the logical key (US layout): ⇧; is `:`.
@@ -67,11 +108,12 @@ fn shifted(k: Key) -> Option<Key> {
 /// - Modifiers match exactly (⌘⌥I is not ⌘I), with ⌘ = Ctrl off the Mac.
 /// - `=` also matches `+` (⌘+ with ⇧ on a US layout, the numpad `+`, the `+` key of Nordic and
 ///   German layouts): Photoshop zooms in on both.
-/// - Delete also matches Backspace (the Mac's "delete" key).
+/// - Delete also matches Backspace (the Mac's "delete" key), and Backspace matches Delete (⌥⌫
+///   and ⌥Delete both fill on Windows).
 /// - A ⇧ shortcut on a punctuation key matches the shifted character (⌘⇧; arrives as ⌘`:`).
 pub fn key_matches(sc: &KeyboardShortcut, key: Key, mods: Modifiers) -> bool {
     let k = sc.logical_key;
-    let direct = key == k || (k == Key::Delete && key == Key::Backspace);
+    let direct = key == k || (k == Key::Delete && key == Key::Backspace) || (k == Key::Backspace && key == Key::Delete);
     let plus = k == Key::Equals && key == Key::Plus;
     let via_shift = sc.modifiers.shift && shifted(k) == Some(key);
     if !(direct || plus || via_shift) {
@@ -113,42 +155,72 @@ fn nav_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     false
 }
 
+/// The key press a clipboard event stands for outside text fields, with `mods` held: Copy, Cut
+/// and Paste are ⌘C, ⌘X and ⌘V (with ⇧/⌥ as held). On Windows egui-winit also sends Cut for
+/// Shift+Delete, which is Edit › Fill here (#530): a Cut with ⇧ and without Ctrl is that key.
+fn clipboard_press(e: &egui::Event, mods: Modifiers, is_windows: bool) -> Option<(Key, Modifiers)> {
+    let held = if mods.command { mods } else { Modifiers::COMMAND };
+    match e {
+        egui::Event::Copy => Some((Key::C, held)),
+        egui::Event::Cut if is_windows && mods.shift && !mods.command => Some((Key::Delete, mods)),
+        egui::Event::Cut => Some((Key::X, held)),
+        egui::Event::Paste(_) => Some((Key::V, held)),
+        _ => None,
+    }
+}
+
 /// egui-winit turns ⌘C / ⌘X / ⌘V into `Event::Copy` / `Cut` / `Paste` and drops the key press, and
 /// drops ⌘V entirely when the clipboard holds no text (an image). Outside text fields, give the
 /// pixel commands their key presses back: Copy/Cut/Paste become ⌘C/⌘X/⌘V presses (with ⇧/⌥ as
 /// held, so ⇧⌘C is Copy Merged), and a ⌘V release without a paste event becomes a ⌘V press.
+///
+/// Ctrl+Insert copies and Shift+Insert pastes: egui-winit maps them on Windows (a Shift+Insert
+/// release without a paste event pastes the image, like ⌘V), and we map them here on Linux.
 pub fn clipboard_keys(ctx: &egui::Context, typing: bool, raw: &mut egui::RawInput) {
+    let press = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+    if cfg!(target_os = "linux") {
+        raw.events.retain_mut(|e| {
+            let egui::Event::Key { key: Key::Insert, pressed: true, modifiers: m, .. } = *e else { return true };
+            match (m.ctrl, m.shift) {
+                (true, false) => *e = egui::Event::Copy,
+                // Text fields need the clipboard text: egui-winit reads it and sends a Paste event.
+                (false, true) if typing => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    return false;
+                }
+                (false, true) => *e = press(Key::V, Modifiers::COMMAND),
+                _ => {}
+            }
+            true
+        });
+    }
     if typing {
         return;
     }
     let seen = egui::Id::new("pc-paste-key-seen");
     // The modifiers held at each event: last frame's, updated as the events report changes.
     let mut mods = ctx.input(|i| i.modifiers);
-    let press = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
     let mut out = Vec::with_capacity(raw.events.len());
     for e in raw.events.drain(..) {
         if let egui::Event::ModifiersChanged(m) | egui::Event::Key { modifiers: m, .. } = &e {
             mods = *m;
         }
-        let held = if mods.command { mods } else { Modifiers::COMMAND };
-        let key = match &e {
-            egui::Event::Copy => Some(Key::C),
-            egui::Event::Cut => Some(Key::X),
-            egui::Event::Paste(_) => Some(Key::V),
-            _ => None,
-        };
-        if let Some(key) = key {
+        if let Some((key, held)) = clipboard_press(&e, mods, cfg!(target_os = "windows")) {
             if key == Key::V {
                 ctx.data_mut(|d| d.insert_temp(seen, true));
             }
             out.push(press(key, held));
             continue;
         }
-        if let egui::Event::Key { key: Key::V, pressed: false, modifiers, .. } = &e
-            && modifiers.command
+        if let egui::Event::Key { key, pressed: false, modifiers, .. } = &e
+            && let Some(held) = match key {
+                Key::V if modifiers.command => Some(*modifiers),
+                Key::Insert if cfg!(target_os = "windows") && modifiers.shift && !modifiers.ctrl => Some(Modifiers::COMMAND),
+                _ => None,
+            }
             && !ctx.data_mut(|d| d.remove_temp::<bool>(seen)).unwrap_or(false)
         {
-            out.push(press(Key::V, *modifiers));
+            out.push(press(Key::V, held));
         }
         out.push(e);
     }
@@ -156,11 +228,37 @@ pub fn clipboard_keys(ctx: &egui::Context, typing: bool, raw: &mut egui::RawInpu
 }
 
 pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
-    if ctx.egui_wants_keyboard_input() || !app.ui.dialogs.is_empty() || app.discard.is_some() {
-        // Dialogs and focused sliders keep canvas zoom; a focused text field keeps its keys.
-        if !ctx.text_edit_focused() {
+    // Camera Raw is modal like Photoshop's filter dialog: no application shortcut (Save, Undo,
+    // tools) runs beneath it, and it handles its own keys (Y, U, O, S). Unlike the other dialogs
+    // below it covers the canvas, so canvas zoom keys are blocked too.
+    if app.camera_raw.is_some() {
+        return;
+    }
+    // An open menu owns the keyboard (arrows, ↩, Esc), like a native menu.
+    if crate::menu_nav::is_open(ctx) {
+        return;
+    }
+    // Liquify is a full-window custom dialog with focusable sliders. egui can therefore claim
+    // keyboard input before the distortion-mode handler below runs. Give Liquify's local
+    // shortcuts first refusal (Undo, brush size, tool keys), but never steal keys from text edits.
+    if app.distort.liquify.is_some() && !ctx.text_edit_focused() {
+        crate::liquify_ui::keys(app, ctx);
+    }
+    use crate::shortcut_dispatch::{Focus, dispatch_pressed};
+    let focus = Focus::of(ctx);
+    // Dialogs (and Liquify's panel while one of its controls has focus) keep canvas zoom; a
+    // focused text field keeps its keys.
+    let liquify_focus = app.distort.liquify.is_some() && focus != Focus::None;
+    if liquify_focus || !app.ui.dialogs.is_empty() || app.discard.is_some() {
+        if focus != Focus::Text {
             nav_keys(app, ctx);
         }
+        return;
+    }
+    if focus == Focus::Text {
+        // A focused field keeps its typing and editing keys; menu shortcuts (⌘J, ⌘S, F7…) still
+        // fire, as in Photoshop.
+        dispatch_pressed(app, ctx, focus, false);
         return;
     }
     // Liquify / Puppet Warp / Perspective Warp: ↩ commits, Esc cancels.
@@ -178,6 +276,21 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
             return;
         }
     }
+    // Move tool / Free Transform: arrows nudge (⇧ ×10, ⌥ duplicates first).
+    if focus == Focus::None && crate::move_mods::arrow_keys(app, ctx) {
+        return;
+    }
+    // Moved pixels still floating: ↩ drops them.
+    if focus == Focus::None
+        && app.session.active().is_some_and(|st| photocraft_engine::float_cmds::floating(st).is_some())
+        && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
+    {
+        if let Err(e) = app.run("select.drop", json!({})) {
+            app.ui.status = e;
+            app.ui.status_error = true;
+        }
+        return;
+    }
     // Pen path in progress: ↩ finishes (open path), Esc cancels.
     if app.ui.pen.is_some() {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
@@ -189,57 +302,58 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
             return;
         }
     }
-    // Inline type editing eats text and navigation keys; ⌘-shortcuts still reach the menus.
-    let editing = crate::type_tool::handle_keys(app, ctx);
-    // Registry + UI command shortcuts, most-modifiers first so ⇧⌘Z wins over ⌘Z.
-    // Edit › Keyboard Shortcuts overrides replace the defaults (and can bind any menu item).
-    let prefs = app.session.prefs();
-    let mut all: Vec<(String, KeyboardShortcut)> = crate::menus::UI_COMMANDS
-        .iter()
-        .filter_map(|(id, _, _, sc)| Some((id.to_string(), parse(prefs.shortcut(id, *sc)?)?)))
-        .chain(photocraft_engine::command_specs().iter().filter_map(|c| Some((c.id.to_string(), parse(prefs.shortcut(c.id, c.shortcut)?)?))))
-        .chain(
-            prefs
-                .shortcuts
-                .iter()
-                .filter(|(id, sc)| {
-                    !sc.is_empty() && photocraft_engine::commands::find(id).is_none() && !crate::menus::UI_COMMANDS.iter().any(|c| c.0 == id.as_str())
-                })
-                .filter_map(|(id, sc)| Some((id.clone(), parse(sc)?))),
-        )
-        .filter(|(_, sc)| sc.modifiers != Modifiers::NONE || !matches!(sc.logical_key, Key::X | Key::D))
-        .collect();
-    all.sort_by_key(|(_, sc)| std::cmp::Reverse(sc.modifiers.shift as u8 + sc.modifiers.alt as u8 + sc.modifiers.command as u8));
-    for (id, sc) in all {
-        // While typing, clipboard/select-all shortcuts belong to the text, not the pixels.
-        if editing && matches!(id.as_str(), "edit.copy" | "edit.cut" | "edit.paste" | "edit.copyMerged" | "select.all" | "edit.pasteSpecial.pasteInPlace") {
-            continue;
-        }
-        if consume(ctx, &sc) {
-            if crate::menus::is_enabled(app, &id) {
-                let r = if crate::adjust_dialog::has_dialog(&id) {
-                    crate::adjust_dialog::open(app, &id);
-                    Ok(serde_json::Value::Null)
-                } else {
-                    crate::menus::invoke(app, ctx, &id, json!({}))
-                };
-                if let Err(e) = r {
-                    app.ui.status = e;
-                }
-            }
+    // Magnetic Lasso: ↩ closes, Esc cancels, ⌫ removes a fastening point (not Edit › Clear),
+    // [ ] change the detection width (not the brush size).
+    if crate::magnetic_lasso_ui::keys(app, ctx) {
+        return;
+    }
+    // While placing polygonal lasso vertices, Backspace/Delete retracts the last point;
+    // it must win over the regular Edit › Clear shortcut, which edits document pixels.
+    if crate::lasso_ui::waiting_for_vertex(app) {
+        let mods = ctx.input(|i| i.modifiers);
+        if !mods.command && !mods.ctrl && !mods.shift && ctx.input_mut(|i| i.consume_key(mods, Key::Backspace) || i.consume_key(mods, Key::Delete)) {
+            crate::lasso_ui::undo_last_vertex(app);
             return;
         }
+    }
+    // The Polygonal Lasso tool likewise: ⌫/Delete removes the last vertex (#1229), and never
+    // reaches Edit › Clear while a polygon is being drawn.
+    if !app.ui.polygon.is_empty() {
+        let mods = ctx.input(|i| i.modifiers);
+        if !mods.command && !mods.ctrl && !mods.shift && ctx.input_mut(|i| i.consume_key(mods, Key::Backspace) || i.consume_key(mods, Key::Delete)) {
+            crate::canvas::polygon_retract(app);
+            return;
+        }
+    }
+    // Inline type editing eats text and navigation keys; ⌘-shortcuts still reach the menus.
+    let editing = crate::type_tool::handle_keys(app, ctx);
+    // Registry, UI and menu-catalogue shortcuts (see [`crate::shortcut_dispatch::bindings`]).
+    if dispatch_pressed(app, ctx, focus, editing) {
+        return;
     }
     if editing {
         return;
     }
-    // Single-key tools and colours (no modifiers).
+    // Single-key tools (no modifiers). D and X (`tools.defaultColors` / `tools.swapColors`) and the
+    // brush keys [ ] ⇧[ ⇧] (`tools.decreaseBrushSize`…) are commands, dispatched above with any
+    // Keyboard Shortcuts override.
     let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
     // Enter / Escape commit or cancel in-progress tool state (polygonal lasso, crop).
+    if crate::lasso_ui::active(app) {
+        let mods = ctx.input(|i| i.modifiers);
+        if ctx.input_mut(|i| i.consume_key(mods, Key::Escape)) {
+            app.drag = None;
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(mods, Key::Enter)) {
+            crate::lasso_ui::commit(app);
+            return;
+        }
+    }
     if !app.ui.polygon.is_empty() || app.ui.crop_rect.is_some() {
         if pressed(Key::Enter) {
             if !app.ui.polygon.is_empty() {
-                crate::canvas::commit_polygon(app, Modifiers::NONE);
+                crate::canvas::commit_polygon(app);
             } else {
                 crate::canvas::commit_crop(app);
             }
@@ -247,7 +361,9 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         if pressed(Key::Escape) {
             app.ui.polygon.clear();
+            app.ui.polygon_mode.clear();
             app.ui.crop_rect = None;
+            app.crop.drag = None;
             return;
         }
     }
@@ -268,19 +384,8 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
             return;
         }
     }
-    if pressed(Key::X) {
-        let _ = app.run("tools.swapColors", json!({}));
-    }
-    if pressed(Key::D) {
-        let _ = app.run("tools.defaultColors", json!({}));
-    }
-    let b = &mut app.session.tools.brush;
-    if pressed(Key::OpenBracket) {
-        b.size = (b.size / 1.25).max(1.0).round();
-    }
-    if pressed(Key::CloseBracket) {
-        b.size = (b.size * 1.25).min(2500.0).round().max(b.size + 1.0);
-    }
+    // 1–0 set opacity, ⇧1–0 flow or fill (`opacity_keys`).
+    crate::opacity_keys::handle(app, ctx);
 }
 
 #[cfg(test)]
@@ -328,6 +433,35 @@ mod tests {
     }
 
     #[test]
+    fn pretty_uses_the_platform_notation() {
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(pretty("Cmd+Shift+N"), if mac { "⌘⇧N" } else { "Ctrl+Shift+N" });
+        // Lone keys and inline-hint combos.
+        assert_eq!(pretty("Alt"), if mac { "⌥" } else { "Alt" });
+        assert_eq!(pretty("Shift+Alt"), if mac { "⇧⌥" } else { "Shift+Alt" });
+        assert_eq!(pretty("Enter"), if mac { "↩" } else { "Enter" });
+        assert_eq!(pretty("Cmd+Enter"), if mac { "⌘↩" } else { "Ctrl+Enter" });
+    }
+
+    #[test]
+    fn labels_show_the_effective_shortcut_in_platform_notation() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        let new = command_label(&app, "New document…", "file.new");
+        if cfg!(target_os = "macos") {
+            assert_eq!(new, "New document…     ⌘N");
+        } else {
+            assert_eq!(new, "New document…     Ctrl+N");
+        }
+        assert_eq!(tip_label(&app, "Rulers", "view.rulers"), format!("Rulers  ({})", pretty("Cmd+R")));
+        // A user override is picked up…
+        app.session.prefs.edit(|p| p.shortcuts.insert("file.new".into(), "Cmd+Shift+N".into()));
+        assert_eq!(command_label(&app, "New document…", "file.new"), format!("New document…     {}", pretty("Cmd+Shift+N")));
+        // …and a removed binding hides the shortcut entirely.
+        app.session.prefs.edit(|p| p.shortcuts.insert("file.new".into(), String::new()));
+        assert_eq!(command_label(&app, "New document…", "file.new"), "New document…");
+    }
+
+    #[test]
     fn clipboard_events_become_pixel_shortcuts_outside_text() {
         let ctx = egui::Context::default();
         let raw = |mut events: Vec<egui::Event>, modifiers| {
@@ -357,6 +491,70 @@ mod tests {
         let mut r = raw(vec![egui::Event::Paste("x".into())], Modifiers::COMMAND);
         clipboard_keys(&ctx, true, &mut r);
         assert!(matches!(r.events.as_slice(), [_, egui::Event::Paste(_)]));
+    }
+
+    /// #530: egui-winit sends Cut for Shift+Delete on Windows; on the canvas it opens Fill.
+    #[test]
+    fn windows_shift_delete_fills_instead_of_cutting() {
+        let shift = Modifiers::SHIFT;
+        let ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+        let app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        let bound = |held| {
+            let (key, mods) = clipboard_press(&egui::Event::Cut, held, true)?;
+            assert_eq!((key, mods), (Key::Delete, held));
+            crate::shortcut_dispatch::bindings(&app).into_iter().find(|(_, sc)| key_matches(sc, key, mods)).map(|(id, _)| id)
+        };
+        assert_eq!(bound(shift).as_deref(), Some("edit.fill"));
+        // ⇧⌥Delete keeps ⌥: fill with the foreground, keeping transparency.
+        assert_eq!(bound(shift | Modifiers::ALT).as_deref(), Some("edit.fillForegroundPreserve"));
+        // Ctrl+X (and Ctrl+Shift+X) still cut; elsewhere a Cut is always ⌘X.
+        assert_eq!(clipboard_press(&egui::Event::Cut, ctrl, true), Some((Key::X, ctrl)));
+        assert_eq!(clipboard_press(&egui::Event::Cut, ctrl | shift, true), Some((Key::X, ctrl | shift)));
+        assert_eq!(clipboard_press(&egui::Event::Cut, shift, false), Some((Key::X, Modifiers::COMMAND)));
+        // Shift+Insert pastes on Windows.
+        assert_eq!(clipboard_press(&egui::Event::Paste("x".into()), shift, true), Some((Key::V, Modifiers::COMMAND)));
+        // Through the raw-input hook on this platform; a text field keeps its Cut.
+        let ctx = egui::Context::default();
+        let cut = || egui::RawInput { events: vec![egui::Event::ModifiersChanged(shift), egui::Event::Cut], ..Default::default() };
+        let mut r = cut();
+        clipboard_keys(&ctx, false, &mut r);
+        let want = if cfg!(target_os = "windows") { Key::Delete } else { Key::X };
+        assert!(matches!(r.events.as_slice(), [_, egui::Event::Key { key, pressed: true, .. }] if *key == want), "{:?}", r.events);
+        let mut r = cut();
+        clipboard_keys(&ctx, true, &mut r);
+        assert!(matches!(r.events.as_slice(), [_, egui::Event::Cut]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ctrl_and_shift_insert_copy_and_paste_on_linux() {
+        let ctx = egui::Context::default();
+        let insert = |modifiers| egui::RawInput {
+            events: vec![egui::Event::Key { key: Key::Insert, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        };
+        let pressed = |r: &egui::RawInput| match r.events.as_slice() {
+            [egui::Event::Key { key, pressed: true, modifiers, .. }] if modifiers.command => Some(*key),
+            _ => None,
+        };
+        // On the canvas they become the pixel commands' ⌘C / ⌘V.
+        let mut r = insert(Modifiers::CTRL);
+        clipboard_keys(&ctx, false, &mut r);
+        assert_eq!(pressed(&r), Some(Key::C));
+        let mut r = insert(Modifiers::SHIFT);
+        clipboard_keys(&ctx, false, &mut r);
+        assert_eq!(pressed(&r), Some(Key::V));
+        // In a text field Ctrl+Insert copies the text; Shift+Insert asks egui-winit for the text.
+        let mut r = insert(Modifiers::CTRL);
+        clipboard_keys(&ctx, true, &mut r);
+        assert!(matches!(r.events.as_slice(), [egui::Event::Copy]));
+        let mut r = insert(Modifiers::SHIFT);
+        clipboard_keys(&ctx, true, &mut r);
+        assert!(r.events.is_empty());
+        // Plain Insert is left alone.
+        let mut r = insert(Modifiers::NONE);
+        clipboard_keys(&ctx, false, &mut r);
+        assert!(matches!(r.events.as_slice(), [egui::Event::Key { key: Key::Insert, .. }]));
     }
 
     #[test]

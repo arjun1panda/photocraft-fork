@@ -2,7 +2,8 @@
 //!
 //! * [`fonts::FontDb`]: bundled fonts (Inter, JetBrains Mono; always available, including on the
 //!   web), optional system fonts from a directory scan (no fontconfig), user font data, TrueType
-//!   collections, PostScript-name lookup.
+//!   collections, PostScript-name lookup. Builds made with the optional craft-fonts input
+//!   (`CRAFT_FONTS_DIR`, see [`craft_fonts`]) also carry its Japanese fonts as fallbacks.
 //! * [`layout`]: shaping and line layout with [parley] (HarfRust shaping, bidi, line breaking),
 //!   point and paragraph (box) text, per-run styles, Photoshop leading/indent/spacing rules.
 //! * [`render`]: anti-aliased rasterization (exact-area accumulation, f32 coverage) into a
@@ -14,10 +15,13 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod cjk;
+pub mod craft_fonts;
 pub mod engine_data;
 pub mod fonts;
 pub mod glyphs;
 pub mod layout;
+pub mod optical;
 pub mod psd;
 pub mod psd_styles;
 pub mod raster;
@@ -28,8 +32,11 @@ pub mod warp;
 use photocraft_color::PixelFormat;
 use photocraft_doc::TextLayer;
 
+pub use craft_fonts::{CRAFT_FONTS, CraftFont};
 pub use fonts::{FaceInfo, FontDb, ResolvedFont};
-pub use layout::{ClusterInfo, LineInfo, PlacedGlyph, TextLayout};
+pub use layout::{
+    ClusterInfo, LineInfo, PlacedGlyph, TextLayout, byte_index, char_index, hit_char, line_edge, line_index, line_step, text_point_inside, word_boundary,
+};
 pub use render::Rendered;
 
 /// Font database + layout context. Create once and reuse (font loading and shaping caches).
@@ -60,6 +67,58 @@ impl TextEngine {
         self.layouter.layout(&mut self.fonts, layer, dpi)
     }
 
+    /// Kerning (1/1000 em) between the character starting at byte `at` and the next one, as
+    /// laid out: the manual kern, or the automatic (metrics / optical) kerning of the pair.
+    /// `None` when there is no such pair on one line.
+    pub fn pair_kerning(&mut self, layer: &TextLayer, dpi: f32, at: usize) -> Option<f32> {
+        let runs = layer.char_runs();
+        let ch = layer.text.get(at..)?.chars().next()?;
+        let next = at + ch.len_utf8();
+        if ch == '\n' || ch == '\r' || layer.text.get(next..)?.chars().next().is_none_or(|c| c == '\n' || c == '\r') {
+            return None;
+        }
+        let gap = |l: &TextLayout| {
+            let a = l.clusters.iter().find(|c| c.range.start == at)?;
+            let b = l.clusters.iter().find(|c| c.range.start == next)?;
+            (a.line == b.line && !a.rtl).then_some(b.x - a.x)
+        };
+        let with = gap(&self.layout(layer, dpi))?;
+        // Em of the pair's first character (px).
+        let mut acc = 0;
+        let style_run = runs.iter().find(|r| {
+            acc += r.len;
+            at < acc
+        })?;
+        let em = style_run.style.size_pt * if dpi > 0.0 { dpi / 72.0 } else { 1.0 };
+        if em.is_nan() || em <= 0.0 {
+            return None;
+        }
+        // The same layer with the pair's first character unkerned.
+        let mut plain = layer.clone();
+        plain.runs = Vec::with_capacity(runs.len() + 2);
+        let mut start = 0;
+        for r in runs {
+            let end = start + r.len;
+            let mut push = |s: usize, e: usize, unkern: bool| {
+                if e > s {
+                    let mut style = r.style.clone();
+                    if unkern {
+                        style.kerning = photocraft_doc::text::Kerning::Off;
+                        style.kern = 0.0;
+                    }
+                    plain.runs.push(photocraft_doc::text::TextRun { len: e - s, style });
+                }
+            };
+            push(start, at.clamp(start, end), false);
+            push(at.clamp(start, end), next.clamp(start, end), true);
+            push(next.clamp(start, end), end, false);
+            start = end;
+        }
+        let without = gap(&self.layout(&plain, dpi))?;
+        let k = (with - without) / em * 1000.0;
+        k.is_finite().then_some(k)
+    }
+
     /// Lays out and rasterizes a text layer into document space.
     pub fn render(&mut self, layer: &TextLayer, dpi: f32, format: PixelFormat) -> (TextLayout, Rendered) {
         let l = self.layout(layer, dpi);
@@ -88,3 +147,5 @@ pub fn shared() -> &'static std::sync::Mutex<TextEngine> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vertical_tests;

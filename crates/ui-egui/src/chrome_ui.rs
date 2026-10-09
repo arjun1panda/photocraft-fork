@@ -20,9 +20,10 @@ pub struct ChromeState {
 }
 
 impl ChromeState {
-    /// Is the Home screen up, given the current number of open documents?
-    pub fn shows_home(&self, documents: usize) -> bool {
-        documents == 0 || self.home == Some(documents)
+    /// Is the Home screen up, given the current number of open documents? With no documents it
+    /// shows by itself when `auto_show` (Preferences › General › Auto show the Home Screen).
+    pub fn shows_home(&self, documents: usize, auto_show: bool) -> bool {
+        (documents == 0 && auto_show) || self.home == Some(documents)
     }
 }
 
@@ -78,52 +79,67 @@ pub fn status_info_text(doc: &Document, key: &str, tool: &str, profile: &str) ->
     match key {
         "sizes" => {
             let (flat, layered) = document_sizes(doc);
-            format!("Doc: {}/{}", fmt_bytes(flat), fmt_bytes(layered))
+            crate::i18n::fmt(tl!("Doc: {flat}/{layered}"), &[("flat", &fmt_bytes(flat)), ("layered", &fmt_bytes(layered))])
         }
         "profile" => format!("{profile} ({bits}bpc)"),
         "measurementScale" => "1 pixel = 1.0000 pixels".into(),
         "scratch" => {
             let (_, layered) = document_sizes(doc);
-            format!("Scratch: {}", fmt_bytes(layered))
+            crate::i18n::fmt(tl!("Scratch: {size}"), &[("size", &fmt_bytes(layered))])
         }
-        "efficiency" => "Efficiency: 100%".into(),
+        "efficiency" => tl!("Efficiency: 100%").into(),
         "tool" => tool.to_string(),
         "layers" => {
             let n = doc.layer_count();
-            format!("{n} {}", if n == 1 { "Layer" } else { "Layers" })
+            crate::i18n::trn(crate::i18n::current(), n as u64, "{n} Layer", "{n} Layers")
         }
-        _ => format!("{} px x {} px ({} ppi)", doc.size.width, doc.size.height, widgets::fmt_num(doc.resolution_dpi as f64)),
+        _ => crate::i18n::fmt(
+            tl!("{w} px x {h} px ({ppi} ppi)"),
+            &[("w", &doc.size.width.to_string()), ("h", &doc.size.height.to_string()), ("ppi", &widgets::fmt_num(doc.resolution_dpi as f64))],
+        ),
     }
 }
 
 fn profile_name(doc: &Document) -> String {
-    if doc.icc_profile.is_none() {
-        return format!("Untagged {}", crate::canvas::mode_label(doc));
+    let mode = crate::canvas::mode_label(doc);
+    let Some(bytes) = doc.icc_profile.as_ref() else {
+        return crate::i18n::fmt(tl!("Untagged {mode}"), &[("mode", tl!(mode))]);
+    };
+    let Ok(profile) = photocraft_engine::color_cmds::profile_from_bytes(bytes) else {
+        return crate::i18n::fmt(tl!("Invalid {mode} profile"), &[("mode", tl!(mode))]);
+    };
+    if profile.color_space != photocraft_engine::color_cmds::mode_space(doc.mode) {
+        return crate::i18n::fmt(tl!("Invalid {mode} profile"), &[("mode", tl!(mode))]);
     }
-    photocraft_engine::color_cmds::document_profile(doc).description.clone()
+    let name: String = profile.description.chars().filter(|c| !c.is_control()).take(128).collect();
+    let name = name.trim();
+    if name.is_empty() {
+        return crate::i18n::fmt(tl!("Unnamed {mode} profile"), &[("mode", tl!(mode))]);
+    }
+    name.to_owned()
 }
 
 /// Status bar body (Pro): zoom %, the chosen info field and its ">" menu, then status messages.
 pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let (Some(st), Some(i)) = (app.session.active(), app.session.active_index()) else {
-        ui.label(RichText::new("No document").color(t.text_dim));
+        ui.label(RichText::new(tl!("No document")).color(t.text_dim));
         return;
     };
-    let text = status_info_text(&st.doc, &app.ui.chrome.status_info, app.ui.tool.label(), &profile_name(&st.doc));
+    let text = status_info_text(&st.doc, &app.ui.chrome.status_info, tl!(app.ui.tool.label()), &profile_name(&st.doc));
     let mut pct = app.ui.views[i].zoom * 100.0;
     if widgets::value_field(ui, &mut pct, 1.0..=3200.0, "%", 64.0).changed() {
         app.ui.views[i].zoom = pct / 100.0;
         app.ui.views[i].fit_pending = false;
     }
     ui.add_space(12.0);
-    ui.label(RichText::new(text).color(t.text_dim).size(12.0));
+    ui.label(RichText::new(tl!(&text)).color(t.text_dim).size(12.0));
     let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(r, t.radius_sm, t.hover);
     }
     icons::paint(ui, r, "chevron-right", 11.0, t.text_dim);
-    let resp = resp.on_hover_text("Show");
+    let resp = resp.on_hover_text(tl!("Show"));
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(200.0);
         for (key, label) in STATUS_INFO {
@@ -146,8 +162,11 @@ pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 /// screen over the open documents, which stay open.
 pub fn home_button(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let n = app.session.documents().len();
-    let on = app.ui.chrome.shows_home(n);
-    if icons::button(ui, "house", 26.0, on && n > 0, "Home").clicked() && n > 0 {
+    let auto = app.session.prefs().general.auto_show_home_screen;
+    let on = app.ui.chrome.shows_home(n, auto);
+    // With no documents and auto-show on, Home can't be dismissed (there's nothing behind it).
+    let can_toggle = n > 0 || !auto;
+    if icons::button(ui, "house", 26.0, on && can_toggle, tl!("Home")).clicked() && can_toggle {
         app.ui.chrome.home = if on { None } else { Some(n) };
     }
 }
@@ -214,6 +233,47 @@ mod tests {
     }
 
     #[test]
+    fn status_profile_describes_rgb_gray_and_custom_profiles_without_mutating_the_document() {
+        let mut rgb = doc();
+        rgb.icc_profile = Some(photocraft_engine::color_cmds::working_profile(rgb.mode).to_bytes());
+        let before = rgb.icc_profile.clone();
+        assert_eq!(profile_name(&rgb), "sRGB IEC61966-2.1");
+        assert_eq!(status_info_text(&rgb, "profile", "", &profile_name(&rgb)), "sRGB IEC61966-2.1 (8bpc)");
+        assert_eq!(rgb.icc_profile, before);
+
+        let mut gray = doc();
+        gray.mode = photocraft_doc::ColorMode::Grayscale;
+        gray.icc_profile = Some(photocraft_engine::color_cmds::working_profile(gray.mode).to_bytes());
+        assert_eq!(profile_name(&gray), "sGray (sRGB tone curve, Photocraft)");
+
+        let mut custom = (*photocraft_engine::color_cmds::working_profile(photocraft_doc::ColorMode::Cmyk)).clone();
+        custom.description = "PhotoCraft Studio CMYK".into();
+        let mut custom_doc = doc();
+        custom_doc.mode = photocraft_doc::ColorMode::Cmyk;
+        custom_doc.icc_profile = Some(custom.with_encoded_bytes().to_bytes());
+        assert_eq!(profile_name(&custom_doc), "PhotoCraft Studio CMYK");
+    }
+
+    #[test]
+    fn status_profile_falls_back_for_malformed_unnamed_and_mismatched_profiles() {
+        let mut malformed = doc();
+        malformed.icc_profile = Some(std::sync::Arc::new(vec![1, 2, 3]));
+        assert_eq!(profile_name(&malformed), "Invalid RGB profile");
+
+        let mut unnamed_profile = (*photocraft_engine::color_cmds::working_profile(photocraft_doc::ColorMode::Cmyk)).clone();
+        unnamed_profile.description.clear();
+        let mut unnamed = doc();
+        unnamed.mode = photocraft_doc::ColorMode::Cmyk;
+        unnamed.icc_profile = Some(unnamed_profile.with_encoded_bytes().to_bytes());
+        assert_eq!(profile_name(&unnamed), "Unnamed CMYK profile");
+
+        let mut mismatched = doc();
+        mismatched.mode = photocraft_doc::ColorMode::Grayscale;
+        mismatched.icc_profile = Some(photocraft_engine::color_cmds::working_profile(photocraft_doc::ColorMode::Rgb).to_bytes());
+        assert_eq!(profile_name(&mismatched), "Invalid Gray profile");
+    }
+
+    #[test]
     fn document_sizes_match_photoshop_rounding() {
         let d = doc();
         // 2400 x 1500 x 3 bytes = 10.3M flattened, as Photoshop shows.
@@ -224,11 +284,20 @@ mod tests {
     #[test]
     fn home_screen_closes_when_a_document_opens() {
         let mut c = ChromeState::default();
-        assert!(c.shows_home(0));
-        assert!(!c.shows_home(2));
+        assert!(c.shows_home(0, true));
+        assert!(!c.shows_home(2, true));
         c.home = Some(2);
-        assert!(c.shows_home(2));
-        assert!(!c.shows_home(3));
+        assert!(c.shows_home(2, true));
+        assert!(!c.shows_home(3, true));
+    }
+
+    #[test]
+    fn auto_show_home_screen_off_leaves_an_empty_workspace() {
+        let mut c = ChromeState::default();
+        assert!(!c.shows_home(0, false), "no Home by itself");
+        c.home = Some(0);
+        assert!(c.shows_home(0, false), "the Home button still opens it");
+        assert!(!c.shows_home(1, false), "opening a document leaves it");
     }
 
     #[test]

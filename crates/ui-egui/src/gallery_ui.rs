@@ -356,8 +356,8 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let title = ERect::from_min_size(full.min, vec2(full.width(), 30.0));
         painter.rect_filled(title, 0.0, t.dock);
         painter.line_segment([title.left_bottom(), title.right_bottom()], Stroke::new(1.0, t.separator));
-        let pct = if d.zoom > 0.0 { format!("{:.0}%", d.zoom * 100.0) } else { "Fit".into() };
-        let name = d.effects.get(d.selected).map_or("", |e| e.filter.name());
+        let pct = if d.zoom > 0.0 { format!("{:.0}%", d.zoom * 100.0) } else { tl!("Fit").into() };
+        let name = d.effects.get(d.selected).map_or("", |e| tl!(e.filter.name()));
         painter.text(title.center(), Align2::CENTER_CENTER, format!("{name} ({}, {pct})", d.layer_name), FontId::proportional(13.0), t.text);
         let body = ERect::from_min_max(pos2(full.left(), title.bottom()), full.max);
         let right = ERect::from_min_size(pos2(body.right() - RIGHT_W, body.top()), vec2(RIGHT_W, body.height()));
@@ -383,18 +383,19 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         painter.rect_filled(zoom_bar, 0.0, t.dock);
         let mut zb = ui.new_child(egui::UiBuilder::new().max_rect(zoom_bar.shrink2(vec2(10.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         let steps = [0.0f32, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0];
-        if crate::icons::button(&mut zb, "minus", 22.0, false, "Zoom out").clicked() {
+        if crate::icons::button(&mut zb, "minus", 22.0, false, tl!("Zoom out")).clicked() {
             d.zoom = steps.iter().rev().copied().find(|&s| s > 0.0 && s < d.zoom.max(0.0) - 1e-3).unwrap_or(0.0);
         }
-        if crate::icons::button(&mut zb, "plus", 22.0, false, "Zoom in").clicked() {
+        if crate::icons::button(&mut zb, "plus", 22.0, false, tl!("Zoom in")).clicked() {
             d.zoom = steps.iter().copied().find(|&s| s > d.zoom + 1e-3).unwrap_or(4.0);
         }
         let mut z = d.zoom;
-        let opts: Vec<(f32, &str)> = vec![(0.0, "Fit in View"), (0.125, "12.5%"), (0.25, "25%"), (0.5, "50%"), (1.0, "100%"), (2.0, "200%"), (4.0, "400%")];
+        let opts: Vec<(f32, &str)> =
+            vec![(0.0, tl!("Fit in View")), (0.125, "12.5%"), (0.25, "25%"), (0.5, "50%"), (1.0, "100%"), (2.0, "200%"), (4.0, "400%")];
         if widgets::dropdown(&mut zb, "gallery-zoom", &mut z, &opts, 110.0) {
             d.zoom = z;
         }
-        zb.label(egui::RichText::new(format!("preview {:.0} ms", d.preview_ms)).color(t.text_faint).size(11.0));
+        zb.label(egui::RichText::new(format!("{} {:.0} ms", tl!("Preview"), d.preview_ms)).color(t.text_faint).size(11.0));
 
         // ---- Category folders with thumbnails ----
         painter.rect_filled(mid, 0.0, t.dock);
@@ -407,7 +408,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 let r = ui.horizontal(|ui| {
                     let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                     crate::icons::paint(ui, ir, icon, 14.0, t.icon);
-                    ui.add(egui::Label::new(egui::RichText::new(*cat).color(t.text)).sense(Sense::click()))
+                    ui.add(egui::Label::new(egui::RichText::new(tl!(*cat)).color(t.text)).sense(Sense::click()))
                 });
                 if r.inner.clicked() {
                     d.open[ci] = !d.open[ci];
@@ -433,7 +434,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             ui.painter().rect_stroke(r, 0.0, stroke, egui::StrokeKind::Outside);
                             ui.add_sized(
                                 [THUMB[0] as f32, 14.0],
-                                egui::Label::new(egui::RichText::new(f.name()).size(10.5).color(if selected { t.text } else { t.text_dim })).truncate(),
+                                egui::Label::new(egui::RichText::new(tl!(f.name())).size(10.5).color(if selected { t.text } else { t.text_dim })).truncate(),
                             );
                             resp
                         });
@@ -456,11 +457,14 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let mut ru = ui.new_child(egui::UiBuilder::new().max_rect(inner));
         ru.spacing_mut().item_spacing.y = 6.0;
         ru.horizontal(|ui| {
-            if widgets::primary_button(ui, "OK", 120.0).clicked() {
-                action = Some("ok");
-            }
-            if widgets::secondary_button(ui, "Cancel", 120.0).clicked() {
-                action = Some("cancel");
+            if let Some(role) = widgets::dialog_buttons(
+                ui,
+                &[
+                    widgets::DialogButton::new(widgets::ButtonRole::Default, tl!("OK"), 120.0),
+                    widgets::DialogButton::new(widgets::ButtonRole::Cancel, tl!("Cancel"), 120.0),
+                ],
+            ) {
+                action = Some(if role == widgets::ButtonRole::Default { "ok" } else { "cancel" });
             }
         });
         ru.add_space(4.0);
@@ -488,7 +492,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         let labels: Vec<String> = options.iter().map(|o| crate::filter_dialog::label(o)).collect();
                         let opts: Vec<(String, &str)> = options.iter().cloned().zip(labels.iter().map(String::as_str)).collect();
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(label).color(t.text_dim));
+                            ui.label(egui::RichText::new(tl!(&label)).color(t.text_dim));
                             widgets::dropdown(ui, &format!("gallery-{}", p.key), &mut c, &opts, 140.0);
                         });
                         e.params.insert(p.key, json!(c));
@@ -508,8 +512,8 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         let neon = photocraft_algo::GalleryEffect::new(GalleryFilter::NeonGlow).color;
                         let mut rgb = c.map_or([neon[0], neon[1], neon[2]], |v| [v[0], v[1], v[2]]);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Glow Color").color(t.text_dim));
-                            ui.color_edit_button_rgb(&mut rgb);
+                            ui.label(egui::RichText::new(tl!("Glow Color")).color(t.text_dim));
+                            crate::widgets::color_edit_button_rgb(ui, &mut rgb);
                         });
                         e.params.insert("glowColor".into(), json!([rgb[0], rgb[1], rgb[2], 1.0]));
                     }
@@ -517,7 +521,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 }
             }
             if e.filter.uses_colours() {
-                ui.label(egui::RichText::new("Uses the foreground and background colours.").color(t.text_faint).size(11.0));
+                ui.label(egui::RichText::new(tl!("Uses the foreground and background colours.")).color(t.text_faint).size(11.0));
             }
         });
         // Effect layers (top of the list = applied last).
@@ -538,7 +542,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 ui.painter().text(
                     row.left_center() + vec2(28.0, 0.0),
                     Align2::LEFT_CENTER,
-                    d.effects[i].filter.name(),
+                    tl!(d.effects[i].filter.name()),
                     FontId::proportional(12.5),
                     if d.effects[i].visible { t.text } else { t.text_faint },
                 );
@@ -555,19 +559,19 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             }
         });
         lu.horizontal(|ui| {
-            if crate::icons::button(ui, "chevron-up", 24.0, false, "Move effect layer up").clicked() {
+            if crate::icons::button(ui, "chevron-up", 24.0, false, tl!("Move effect layer up")).clicked() {
                 let s = d.selected;
                 d.move_to(s, (s + 1).min(d.effects.len() - 1));
             }
-            if crate::icons::button(ui, "chevron-down", 24.0, false, "Move effect layer down").clicked() {
+            if crate::icons::button(ui, "chevron-down", 24.0, false, tl!("Move effect layer down")).clicked() {
                 let s = d.selected;
                 d.move_to(s, s.saturating_sub(1));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if crate::icons::button(ui, "trash", 24.0, false, "Delete effect layer").clicked() {
+                if crate::icons::button(ui, "trash", 24.0, false, tl!("Delete effect layer")).clicked() {
                     d.delete();
                 }
-                if crate::icons::button(ui, "file-plus", 24.0, false, "New effect layer").clicked() {
+                if crate::icons::button(ui, "file-plus", 24.0, false, tl!("New effect layer")).clicked() {
                     d.add();
                 }
             });

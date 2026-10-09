@@ -227,8 +227,86 @@ fn big_tips_are_downsampled() {
 }
 
 #[test]
+fn tilt_scale_projection_spacing_and_mixer_fields_map() {
+    let tip = Descriptor::new("computedBrush").with("Dmtr", u(b"#Pxl", 30.0)).with("Spcn", prc(35.0)).with("Intr", Value::Boolean(false));
+    let preset = Descriptor::new("brushPreset")
+        .with("Nm  ", t("Wet Pen"))
+        .with("Brsh", Value::Descriptor(tip))
+        .with("useTipDynamics", Value::Boolean(true))
+        .with("szVr", var(3, 0.0, 0.0))
+        .with("tiltScale", prc(150.0))
+        .with("brushProjection", Value::Boolean(true))
+        .with("usePaintDynamics", Value::Boolean(true))
+        .with("wtVr", var(2, 30.0, 10.0))
+        .with("mxVr", var(1, 45.0, 0.0))
+        .with(
+            "toolOptions",
+            Value::Descriptor(
+                Descriptor::new("currentToolOptions")
+                    .with("wetness", prc(80.0))
+                    .with("dryness", prc(20.0))
+                    .with("mix", prc(65.0))
+                    .with("flow", prc(70.0))
+                    .with("sampleMerged", Value::Boolean(true)),
+            ),
+        );
+    let plain =
+        Descriptor::new("brushPreset").with("Nm  ", t("Plain")).with("Brsh", Value::Descriptor(Descriptor::new("computedBrush").with("Dmtr", u(b"#Pxl", 9.0))));
+    let bytes = write_v6(2, &[], &[], &[preset, plain], true).unwrap();
+    let imp = read_abr(&bytes, "Mixer").unwrap();
+    let b = &imp.presets[0].brush;
+    assert!(!b.spacing_enabled && (b.spacing - 0.35).abs() < 1e-6, "Intr off = Spacing unchecked, the value kept");
+    let sd = &b.shape_dynamics;
+    assert!(sd.brush_projection && (sd.tilt_scale - 1.5).abs() < 1e-6 && sd.size.control == Control::PenTilt);
+    let tr = &b.transfer;
+    assert_eq!((tr.wetness.control, tr.wetness.jitter, tr.wetness.minimum), (Control::PenPressure, 0.3, 0.1));
+    assert_eq!((tr.mix.control, tr.mix.jitter), (Control::Fade, 0.45));
+    let m = &b.mixer;
+    assert_eq!((m.wet, m.load, m.mix, m.flow, m.sample_all_layers), (0.8, 0.2, 0.65, 0.7, true));
+    assert!(!imp.warnings.iter().any(|w| w.contains("Tilt Scale") || w.contains("Projection") || w.contains("Mixer")), "{:?}", imp.warnings);
+    // Defaults when the file says nothing.
+    let p = &imp.presets[1].brush;
+    assert!(p.spacing_enabled && !p.shape_dynamics.brush_projection && p.shape_dynamics.tilt_scale == 0.0);
+    assert_eq!(p.mixer, photocraft_paint::MixerSettings::default());
+    assert_eq!((p.transfer.wetness, p.transfer.mix), (Dynamic::default(), Dynamic::default()));
+}
+
+#[test]
 fn garbage_is_an_error() {
     assert!(read_abr(b"", "g").is_err());
     assert!(read_abr(b"8BPS not a brush", "g").is_err());
     assert!(read_abr(&[0, 6, 0, 2], "g").is_err());
+}
+
+#[test]
+fn sampled_tip_paints_the_brush_colour_never_black() {
+    // An imported tip is coverage: its pixels decide where paint lands, never what colour.
+    // A black tip pixel must mean "no paint", and a painted pixel must carry the brush colour,
+    // so a regression that treats the tip bitmap as RGB shows up here as black output.
+    use photocraft_color::PixelFormat;
+    use photocraft_paint::StrokePoint;
+    use photocraft_paint::render::render_stroke;
+    use photocraft_raster::Surface;
+
+    let preset = Descriptor::new("brushPreset").with("Nm  ", t("Tip")).with("Brsh", Value::Descriptor(sampled_tip("$tip-1")));
+    let bytes = write_v6(2, &[sample("$tip-1", 8, 8, 8)], &[], &[preset], false).unwrap();
+    let imp = read_abr(&bytes, "Test").unwrap();
+    let mut b = imp.presets[0].brush.clone();
+    b.pressure_size = false;
+    b.color = [0.8, 0.1, 0.1, 1.0];
+    let mut s = Surface::new(PixelFormat::RGBA32F);
+    render_stroke(&mut s, &b, &[StrokePoint::new(30.0, 32.5, 1.0), StrokePoint::new(34.0, 32.5, 1.0)], None, false, 1.0);
+    let mut painted = 0;
+    for y in 0..64 {
+        for x in 0..64 {
+            let p = s.rgba(x, y);
+            if p[3] > 0.5 {
+                painted += 1;
+                assert!((p[0] - 0.8).abs() < 0.05 && (p[1] - 0.1).abs() < 0.05, "not the brush colour at ({x},{y}): {p:?}");
+            }
+        }
+    }
+    // The helper writes an alternating 255/0 tip, so both painted and unpainted pixels exist.
+    assert!(painted > 0, "the imported tip painted nothing");
+    assert!(painted < 64 * 64, "the tip covered everything - coverage was treated as solid colour");
 }

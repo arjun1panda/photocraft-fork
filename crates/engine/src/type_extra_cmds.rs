@@ -14,7 +14,7 @@ use photocraft_text::render::PathEl;
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, layer_param};
-use crate::type_cmds::{refresh, replace_text, style_paragraphs, style_range};
+use crate::type_cmds::{is_auto_named, layer_name, refresh, replace_text, style_paragraphs, style_range};
 use crate::{EngineError, Result, Session};
 
 /// Photoshop's Paste Lorem Ipsum filler.
@@ -70,11 +70,16 @@ fn with_text<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut Tex
     s.edit(label, |doc, _| {
         let snapshot = doc.clone();
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+        let auto_named = is_auto_named(l);
         let LayerContent::Text(t) = &mut l.content else {
-            return Err(EngineError::Other(format!("layer {} is a {} layer, not a type layer", id.0, l.content.kind_name())));
+            return Err(EngineError::Other(format!("layer {} is {} {} layer, not a type layer", id.0, l.content.article(), l.content.kind_name())));
         };
         let r = f(t, &snapshot)?;
         refresh(&snapshot, t);
+        let name = auto_named.then(|| layer_name(&t.text));
+        if let Some(n) = name {
+            l.name = n;
+        }
         Ok(r)
     })
 }
@@ -128,8 +133,7 @@ fn set_orientation(s: &mut Session, p: &Value, o: Orientation) -> Result<Value> 
         t.orientation = o;
         Ok(())
     })?;
-    // Vertical layout is stored and saved (PSD `Ornt`), but rendered horizontally for now.
-    Ok(json!({"orientation": if o == Orientation::Vertical { "vertical" } else { "horizontal" }, "rendered": "horizontal"}))
+    Ok(json!({"orientation": if o == Orientation::Vertical { "vertical" } else { "horizontal" }}))
 }
 
 // ---------- point ⇄ paragraph ----------
@@ -137,10 +141,26 @@ fn set_orientation(s: &mut Session, p: &Value, o: Orientation) -> Result<Value> 
 fn to_paragraph(s: &mut Session, p: &Value) -> Result<Value> {
     let r = with_text(s, p, "Convert to Paragraph Text", |t, doc| {
         let l = layout(doc, t);
-        let [x0, y0, x1, y1] = l.bounds().unwrap_or([0.0, -t.size_pt, t.size_pt, 0.0]);
         let size_px = t.char_runs().iter().map(|r| r.style.size_pt).fold(t.size_pt, f32::max) * doc.resolution_dpi / 72.0;
         let ps = t.paragraph_runs().first().map(|p| p.style.clone()).unwrap_or_default();
         let indents = (ps.start_indent_pt + ps.end_indent_pt).max(0.0) * doc.resolution_dpi / 72.0;
+        if l.vertical {
+            // Line space: u along the columns, v across them (first column centred on v = 0).
+            let [u0, v0, u1, v1] = l.line_bounds().unwrap_or([0.0, -size_px / 2.0, size_px, size_px / 2.0]);
+            let height = (u1 - u0).max(1.0) + indents + (size_px * 0.5).max(4.0);
+            let width = (v1 - v0).max(1.0) + size_px * 0.5;
+            let y = match ps.align {
+                TextAlign::Center | TextAlign::JustifyCenter => -height / 2.0,
+                TextAlign::Right | TextAlign::JustifyRight => -height,
+                _ => 0.0,
+            };
+            // The box's right edge is the first column's right edge, so the columns stay put.
+            let x = -v0 - width;
+            t.shape = TextShape::Box { x: 0.0, y: 0.0, width, height };
+            t.transform = then_translate(&t.transform, f64::from(x), f64::from(y));
+            return Ok(json!([x, y, width, height]));
+        }
+        let [x0, y0, x1, y1] = l.bounds().unwrap_or([0.0, -t.size_pt, t.size_pt, 0.0]);
         // A little slack so no line re-wraps; the box keeps the text where it was.
         let width = (x1 - x0).max(1.0) + indents + (size_px * 0.5).max(4.0);
         let height = (y1 - y0).max(1.0) + size_px * 0.5;
@@ -164,8 +184,10 @@ fn to_paragraph(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn to_point(s: &mut Session, p: &Value) -> Result<Value> {
     let r = with_text(s, p, "Convert to Point Text", |t, doc| {
-        let TextShape::Box { x, width, .. } = t.shape else { return Err(EngineError::Other("already point text".into())) };
+        let TextShape::Box { x, y, width, height } = t.shape else { return Err(EngineError::Other("already point text".into())) };
         let l = layout(doc, t);
+        // Vertical type: columns run along the box height.
+        let (x, width) = if l.vertical { (y, height) } else { (x, width) };
         let baseline = l.lines.first().map_or(0.0, |ln| ln.baseline);
         // Photoshop inserts a hard return at every soft line break.
         let mut breaks: Vec<usize> = l.lines.windows(2).filter(|w| w[0].paragraph == w[1].paragraph).map(|w| w[1].range.start).collect();
@@ -181,8 +203,9 @@ fn to_point(s: &mut Session, p: &Value) -> Result<Value> {
             _ => x,
         };
         t.shape = TextShape::Point;
-        // `baseline` is in text space (it already includes the box top).
-        t.transform = then_translate(&t.transform, f64::from(ax), f64::from(baseline));
+        // `baseline` is in line space (it already includes the box edge).
+        let (tx, ty) = l.to_text(ax, baseline);
+        t.transform = then_translate(&t.transform, f64::from(tx), f64::from(ty));
         Ok(breaks.len())
     })?;
     Ok(json!({"inserted": r}))
@@ -371,7 +394,7 @@ fn paste_lorem(s: &mut Session, p: &Value) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let (w, h) = (d.doc.size.width as f64, d.doc.size.height as f64);
     let size = p.get("size").and_then(Value::as_f64).unwrap_or((h / 20.0 * 72.0 / f64::from(d.doc.resolution_dpi)).clamp(6.0, 72.0));
-    let r = s.execute("type.create", json!({"box": [w * 0.1, h * 0.1, w * 0.8, h * 0.8], "text": LOREM_IPSUM, "size": size, "name": "Lorem ipsum"}))?;
+    let r = s.execute("type.create", json!({"box": [w * 0.1, h * 0.1, w * 0.8, h * 0.8], "text": LOREM_IPSUM, "size": size}))?;
     Ok(json!({"layer": r["layer"]}))
 }
 
@@ -501,14 +524,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("type.antiAlias.windowsLcd", "Windows LCD", &["Type", "Anti-Alias"], LP, has_text, |s, p| set_aa(s, p, AntiAlias::WindowsLcd)),
         spec!("type.antiAlias.windows", "Windows", &["Type", "Anti-Alias"], LP, has_text, |s, p| set_aa(s, p, AntiAlias::Windows)),
         spec!("type.orientation.horizontal", "Horizontal", &["Type", "Orientation"], LP, has_text, |s, p| set_orientation(s, p, Orientation::Horizontal)),
-        spec!(
-            "type.orientation.vertical",
-            "Vertical",
-            &["Type", "Orientation"],
-            r##"{"layer":id?} (stored and saved; rendered horizontally for now)"##,
-            has_text,
-            |s, p| set_orientation(s, p, Orientation::Vertical)
-        ),
+        spec!("type.orientation.vertical", "Vertical", &["Type", "Orientation"], LP, has_text, |s, p| set_orientation(s, p, Orientation::Vertical)),
         spec!("type.openType.standardLigatures", "Standard Ligatures", &["Type", "OpenType"], OT, has_text, |s, p| toggle_opentype(s, p, "liga")),
         spec!("type.openType.contextualAlternates", "Contextual Alternates", &["Type", "OpenType"], OT, has_text, |s, p| toggle_opentype(s, p, "calt")),
         spec!("type.openType.discretionaryLigatures", "Discretionary Ligatures", &["Type", "OpenType"], OT, has_text, |s, p| toggle_opentype(s, p, "dlig")),

@@ -174,7 +174,7 @@ fn new_workspace(app: &mut PhotocraftApp, p: &Value) -> Result<Value, String> {
         return Err(format!("\"{name}\" is a built-in workspace"));
     }
     let prefs = app.session.prefs().clone();
-    let mut ws = json!({"panels": app.ui.panels, "dockTabs": app.ui.dock_tabs});
+    let mut ws = json!({"panels": app.ui.panels, "dockTabs": app.ui.dock_tabs, "dock": app.ui.dock});
     if p.get("keyboardShortcuts").and_then(Value::as_bool) == Some(true) {
         ws["shortcuts"] = json!(prefs.shortcuts);
     }
@@ -221,12 +221,9 @@ fn select_workspace(app: &mut PhotocraftApp, p: &Value) -> Result<Value, String>
 /// Apply the current workspace when it is a saved one. Returns false for the built-in presets.
 pub fn apply_custom(app: &mut PhotocraftApp) -> bool {
     let Some(ws) = app.session.prefs().workspaces.get(&app.ui.workspace).cloned() else { return false };
-    if let Ok(p) = serde_json::from_value(ws["panels"].clone()) {
-        app.ui.panels = p;
-    }
-    if let Ok(t) = serde_json::from_value(ws["dockTabs"].clone()) {
-        app.ui.dock_tabs = t;
-    }
+    // Workspaces saved before the dock layout existed get the default heights.
+    app.ui.dock = Default::default();
+    crate::dock::apply(app, &ws);
     let (sc, menus, toolbar) = (ws.get("shortcuts").cloned(), ws.get("menus").cloned(), ws.get("toolbar").cloned());
     if sc.is_some() || menus.is_some() || toolbar.is_some() {
         app.session.prefs.edit(|p| {
@@ -278,6 +275,26 @@ fn custom_par(app: &mut PhotocraftApp, p: &Value) -> Result<Value, String> {
     Ok(json!({"pixelAspectRatio": c.ratio, "name": c.name}))
 }
 
+/// The Show Extras Options… checkboxes as (field, label). The fields are the serialized
+/// [`crate::view_cmds::Show`] names, the keys the dialog is seeded with and its command accepts.
+fn extras_options() -> [(&'static str, &'static str); 13] {
+    [
+        ("layer_edges", tl!("Layer Edges")),
+        ("selection_edges", tl!("Selection Edges")),
+        ("target_path", tl!("Target Path")),
+        ("notes", tl!("Notes")),
+        ("pixel_grid", tl!("Pixel Grid")),
+        ("slices", tl!("Slices")),
+        ("count", tl!("Count")),
+        ("smart_guides", tl!("Smart Guides")),
+        ("brush_preview", tl!("Brush Preview")),
+        ("mesh", tl!("Mesh")),
+        ("edit_pins", tl!("Edit Pins")),
+        ("canvas_guides", tl!("Canvas Guides")),
+        ("artboard_guides", tl!("Artboard Guides")),
+    ]
+}
+
 /// The open dialog's OK as (command id, params).
 pub fn dialog_command(kind: &str, f: &Map<String, Value>) -> Option<(&'static str, Value)> {
     Some(match kind {
@@ -295,12 +312,13 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if app.ui.shell.modifier_keys {
         let mut close = false;
         let mut s = app.ui.shell.clone();
-        let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
-        let alt = if cfg!(target_os = "macos") { "⌥" } else { "Alt" };
-        crate::analysis_ui::panel_window(app, ctx, "modifier-keys", "Modifier Keys", vec2(-420.0, 80.0), 150.0, |ui| {
-            close = crate::analysis_ui::title_row(ui, "Modifier Keys");
+        let cmd = crate::shortcuts::pretty("Cmd");
+        let shift = crate::shortcuts::pretty("Shift");
+        let alt = crate::shortcuts::pretty("Alt");
+        crate::analysis_ui::panel_window(app, ctx, "modifier-keys", tl!("Modifier Keys"), vec2(-420.0, 80.0), 150.0, |ui| {
+            close = crate::analysis_ui::title_row(ui, tl!("Modifier Keys"));
             ui.horizontal(|ui| {
-                for (label, on) in [("⇧", &mut s.sticky_shift), (cmd, &mut s.sticky_command), (alt, &mut s.sticky_alt)] {
+                for (label, on) in [(&*shift, &mut s.sticky_shift), (&*cmd, &mut s.sticky_command), (&*alt, &mut s.sticky_alt)] {
                     if ui.add(egui::Button::new(RichText::new(label).size(14.0)).selected(*on).min_size(vec2(40.0, 30.0))).clicked() {
                         *on = !*on;
                     }
@@ -330,12 +348,12 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
     egui::Window::new(title).id(egui::Id::new("shell-dialog")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(
         ctx,
         |ui| {
-            ui.label(RichText::new(title).color(t.text).size(13.0).strong());
+            ui.label(RichText::new(tl!(&title)).color(t.text).size(13.0).strong());
             crate::widgets::hairline(ui);
             ui.add_space(6.0);
             let text = |ui: &mut egui::Ui, f: &mut Map<String, Value>, key: &str, label: &str| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).color(t.text_dim).size(11.0));
+                    ui.label(RichText::new(tl!(&label)).color(t.text_dim).size(11.0));
                     let mut v = f.get(key).and_then(Value::as_str).unwrap_or("").to_string();
                     if ui.add(egui::TextEdit::singleline(&mut v).desired_width(180.0)).changed() {
                         f.insert(key.into(), json!(v));
@@ -350,7 +368,7 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
             };
             let number = |ui: &mut egui::Ui, f: &mut Map<String, Value>, key: &str, label: &str, range: std::ops::RangeInclusive<f32>| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).color(t.text_dim).size(11.0));
+                    ui.label(RichText::new(tl!(&label)).color(t.text_dim).size(11.0));
                     let mut v = f.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
                     if crate::widgets::slider(ui, &mut v, range.clone(), None).changed() | crate::widgets::value_field(ui, &mut v, range, "", 60.0).changed() {
                         f.insert(key.into(), json!(v));
@@ -359,16 +377,16 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
             };
             match kind.as_str() {
                 "newWorkspace" => {
-                    text(ui, &mut f, "name", "Name:");
-                    ui.label(RichText::new("Capture").color(t.text_dim).size(11.0));
+                    text(ui, &mut f, "name", tl!("Name:"));
+                    ui.label(RichText::new(tl!("Capture")).color(t.text_dim).size(11.0));
                     ui.label(
-                        RichText::new("Panel locations are saved in the workspace. Keyboard shortcuts, menus and toolbar are optional.")
+                        RichText::new(tl!("Panel locations are saved in the workspace. Keyboard shortcuts, menus and toolbar are optional."))
                             .color(t.text_faint)
                             .size(10.5),
                     );
-                    check(ui, &mut f, "keyboardShortcuts", "Keyboard Shortcuts");
-                    check(ui, &mut f, "menus", "Menus");
-                    check(ui, &mut f, "toolbar", "Toolbar");
+                    check(ui, &mut f, "keyboardShortcuts", tl!("Keyboard Shortcuts"));
+                    check(ui, &mut f, "menus", tl!("Menus"));
+                    check(ui, &mut f, "toolbar", tl!("Toolbar"));
                 }
                 "deleteWorkspace" => {
                     let mut cur = f.get("name").and_then(Value::as_str).unwrap_or("").to_string();
@@ -378,8 +396,8 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     }
                 }
                 "customPar" => {
-                    text(ui, &mut f, "name", "Name:");
-                    number(ui, &mut f, "ratio", "Factor:", 0.1..=10.0);
+                    text(ui, &mut f, "name", tl!("Name:"));
+                    number(ui, &mut f, "ratio", tl!("Factor:"), 0.1..=10.0);
                 }
                 "preview32" => {
                     let mut m = f.get("method").and_then(Value::as_str).unwrap_or("exposureGamma").to_string();
@@ -387,32 +405,18 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         ui,
                         "p32-method",
                         &mut m,
-                        &[("exposureGamma".to_string(), "Exposure and Gamma"), ("highlightCompression".to_string(), "Highlight Compression")],
+                        &[("exposureGamma".to_string(), tl!("Exposure and Gamma")), ("highlightCompression".to_string(), tl!("Highlight Compression"))],
                         180.0,
                     ) {
                         f.insert("method".into(), json!(m));
                     }
                     ui.add_enabled_ui(m == "exposureGamma", |ui| {
-                        number(ui, &mut f, "exposure", "Exposure:", -20.0..=20.0);
-                        number(ui, &mut f, "gamma", "Gamma:", 0.1..=9.99);
+                        number(ui, &mut f, "exposure", tl!("Exposure:"), -20.0..=20.0);
+                        number(ui, &mut f, "gamma", tl!("Gamma:"), 0.1..=9.99);
                     });
                 }
                 _ => {
-                    for (k, label) in [
-                        ("layerEdges", "Layer Edges"),
-                        ("selectionEdges", "Selection Edges"),
-                        ("targetPath", "Target Path"),
-                        ("notes", "Notes"),
-                        ("pixelGrid", "Pixel Grid"),
-                        ("slices", "Slices"),
-                        ("count", "Count"),
-                        ("smartGuides", "Smart Guides"),
-                        ("brushPreview", "Brush Preview"),
-                        ("mesh", "Mesh"),
-                        ("editPins", "Edit Pins"),
-                        ("canvasGuides", "Canvas Guides"),
-                        ("artboardGuides", "Artboard Guides"),
-                    ] {
+                    for (k, label) in extras_options() {
                         check(ui, &mut f, k, label);
                     }
                 }
@@ -420,12 +424,15 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let ok = if kind == "deleteWorkspace" { "Delete" } else { "OK" };
-                    if crate::widgets::primary_button(ui, ok, 70.0).clicked() {
-                        result = Some(true);
-                    }
-                    if crate::widgets::secondary_button(ui, "Cancel", 70.0).clicked() {
-                        result = Some(false);
+                    let ok = if kind == "deleteWorkspace" { tl!("Delete") } else { tl!("OK") };
+                    if let Some(role) = crate::widgets::dialog_buttons(
+                        ui,
+                        &[
+                            crate::widgets::DialogButton::new(crate::widgets::ButtonRole::Default, ok, 70.0),
+                            crate::widgets::DialogButton::new(crate::widgets::ButtonRole::Cancel, tl!("Cancel"), 70.0),
+                        ],
+                    ) {
+                        result = Some(role == crate::widgets::ButtonRole::Default);
                     }
                 });
             });
@@ -550,6 +557,31 @@ mod tests {
         assert!(!app.ui.view.show.count);
         assert!(inv(&mut app, "view.show.showExtrasOptions", json!({"bogus": true})).is_err());
         crate::analysis_ui::tests::render(&mut app, &ctx, windows);
+    }
+
+    #[test]
+    fn extras_options_checkboxes_show_and_change_every_flag() {
+        let (mut app, ctx) = app();
+        let before = serde_json::to_value(app.ui.view.show).unwrap();
+        crate::menus::invoke(&mut app, &ctx, "view.show.showExtrasOptions", json!({})).unwrap();
+        let (kind, mut f) = app.ui.shell.dialog.clone().unwrap();
+        // Every checkbox reads the seeded value of its flag (Selection Edges is on by default).
+        assert_eq!(extras_options().len(), f.len());
+        for (k, _) in extras_options() {
+            assert!(before[k].is_boolean(), "{k} is not a Show field");
+            assert_eq!(f.get(k).and_then(Value::as_bool), before[k].as_bool(), "{k}");
+        }
+        // Ticking every box (one- and multi-word flags in one submission) applies them all on OK.
+        for (k, _) in extras_options() {
+            let on = !f.get(k).and_then(Value::as_bool).unwrap();
+            f.insert(k.into(), json!(on));
+        }
+        let (id, p) = dialog_command(&kind, &f).unwrap();
+        crate::menus::invoke(&mut app, &ctx, id, p).unwrap();
+        let after = serde_json::to_value(app.ui.view.show).unwrap();
+        for (k, _) in extras_options() {
+            assert_eq!(after[k].as_bool(), before[k].as_bool().map(|b| !b), "{k}");
+        }
     }
 
     #[test]

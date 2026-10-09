@@ -30,7 +30,7 @@ pub fn open(path: &Path) -> Result<Opened, AutomationError> {
     if path.is_dir() {
         return Ok(Opened { document: photocraft_format::load_path(path)?, warnings: Vec::new() });
     }
-    let bytes = std::fs::read(path).map_err(|e| AutomationError::Io(format!("{}: {e}", path.display())))?;
+    let bytes = photocraft_format::read_file(path).map_err(|e| AutomationError::Io(format!("{}: {e}", path.display())))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     open_bytes(&name, &bytes)
 }
@@ -61,10 +61,8 @@ pub fn save(
         return Ok(Vec::new());
     }
     let r = photocraft_io::export(doc, &ext, opts)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|e| AutomationError::Io(e.to_string()))?;
-    }
-    std::fs::write(path, &r.bytes).map_err(|e| AutomationError::Io(format!("{}: {e}", path.display())))?;
+    // Crash-safe: a failed write never destroys the previous file.
+    photocraft_format::atomic_write(path, &r.bytes).map_err(|e| AutomationError::Io(e.to_string()))?;
     Ok(r.warnings)
 }
 

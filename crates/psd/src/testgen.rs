@@ -281,6 +281,7 @@ pub fn layered(version: Version, mode: ColorMode, depth: u16, compression: Compr
         parameters: Some(MaskParameters { flags: 0b0011, user_density: Some(200), user_feather: Some(1.5), vector_density: None, vector_feather: None }),
         real: Some(RealMask { flags: 0, background: 255, rect: Rect::from_xywh(0, 0, 3, 3) }),
         trailing: Vec::new(),
+        real_first: true,
     };
     next(&mut layers, Rect::from_xywh(3, 3, 6, 4), "Grüße", BlendMode::ColorDodge, Some(real_mask));
     layers.push(group_record(&header, "Inner", SectionType::ClosedFolder, BlendMode::Normal, id0 + 2));
@@ -374,7 +375,7 @@ pub fn all_cases() -> Vec<Case> {
         for c in Compression::ALL {
             v.push(Case { name: format!("small {version:?} {c:?}"), file: small(version, c) });
         }
-        v.push(Case { name: format!("empty canvas {version:?}"), file: merged_only(version, ColorMode::Rgb, 8, Compression::Rle, 0, 0) });
+        v.push(Case { name: format!("1x1 canvas {version:?}"), file: merged_only(version, ColorMode::Rgb, 8, Compression::Rle, 1, 1) });
     }
     v
 }
